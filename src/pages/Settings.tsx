@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
+import type { BackupSettings } from "../types";
 
 export default function Settings() {
   const navigate = useNavigate();
@@ -10,6 +11,9 @@ export default function Settings() {
   const [version, setVersion] = useState("");
   const [autofetch, setAutofetch] = useState(false);
   const [autofetchLoading, setAutofetchLoading] = useState(true);
+  const [backup, setBackup] = useState<BackupSettings | null>(null);
+  const [backupLoading, setBackupLoading] = useState(false);
+  const [backingUp, setBackingUp] = useState(false);
   const [status, setStatus] = useState<{
     type: "success" | "error";
     message: string;
@@ -25,6 +29,64 @@ export default function Settings() {
       .catch(() => setAutofetch(false))
       .finally(() => setAutofetchLoading(false));
   }, []);
+
+  const loadBackupSettings = () => {
+    setBackupLoading(true);
+    invoke<BackupSettings>("get_backup_settings")
+      .then(setBackup)
+      .catch(() => setBackup(null))
+      .finally(() => setBackupLoading(false));
+  };
+
+  useEffect(() => {
+    loadBackupSettings();
+  }, []);
+
+  const handleFrequencyChange = async (frequency: string) => {
+    const prev = backup;
+    setBackup((b) => (b ? { ...b, frequency } : b));
+    try {
+      await invoke("set_backup_frequency", { frequency });
+    } catch (err) {
+      setBackup(prev);
+      setStatus({ type: "error", message: `Failed to save setting: ${err}` });
+    }
+  };
+
+  const handleBackupNow = async () => {
+    setBackingUp(true);
+    setStatus(null);
+    try {
+      const name = await invoke<string>("do_backup_now");
+      setStatus({ type: "success", message: `Backup created: ${name}` });
+      loadBackupSettings();
+    } catch (err) {
+      setStatus({ type: "error", message: `Backup failed: ${err}` });
+    } finally {
+      setBackingUp(false);
+    }
+  };
+
+  const handleOpenBackups = async () => {
+    try {
+      await invoke("open_backups_folder");
+    } catch (err) {
+      setStatus({ type: "error", message: `Failed to open folder: ${err}` });
+    }
+  };
+
+  const formatBackupTime = (iso: string | null) => {
+    if (!iso) return "Never";
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    return d.toLocaleString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  };
 
   const handleSave = async () => {
     if (!appId.trim() || !userToken.trim()) {
@@ -57,14 +119,6 @@ export default function Settings() {
       setAutofetch(!enabled);
       setStatus({ type: "error", message: `Failed to save setting: ${err}` });
     }
-  };
-
-  const unixToReadable = (ts: string) => {
-    const n = Number(ts);
-    if (!n) return ts;
-    const d = new Date(n * 1000);
-    const pad = (v: number) => String(v).padStart(2, "0");
-    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
   };
 
   return (
@@ -138,9 +192,51 @@ export default function Settings() {
         </label>
       </div>
 
+      <div className="card" style={{ marginTop: "16px" }}>
+        <h3>Backups</h3>
+        <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)", marginBottom: "12px" }}>
+          Snapshots of your database are stored locally as compressed <code>.db.gz</code> files.
+          They are kept separate from iCloud so they survive even if the live database is lost.
+        </p>
+
+        <div className="form-group">
+          <label htmlFor="backupFreq">Backup frequency</label>
+          <select
+            id="backupFreq"
+            value={backup?.frequency ?? "off"}
+            disabled={backupLoading}
+            onChange={(e) => handleFrequencyChange(e.target.value)}
+          >
+            <option value="off">Off</option>
+            <option value="daily">Daily (keeps last 30)</option>
+            <option value="weekly">Weekly (keeps last 12)</option>
+            <option value="monthly">Monthly (keeps last 24)</option>
+          </select>
+        </div>
+
+        <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)", marginBottom: "12px" }}>
+          Last backup: {backup ? formatBackupTime(backup.last_backup_at) : "…"}
+          <br />
+          Location: {backup?.backup_dir ?? "…"}{backup?.is_default_dir ? " (default)" : ""}
+        </div>
+
+        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+          <button
+            className="btn btn-primary"
+            onClick={handleBackupNow}
+            disabled={backingUp}
+          >
+            {backingUp ? "Backing up…" : "Back up now"}
+          </button>
+          <button className="btn" onClick={handleOpenBackups}>
+            Open backups folder
+          </button>
+        </div>
+      </div>
+
       <div className="card" style={{ marginTop: "16px", textAlign: "center" }}>
         <p style={{ fontSize: "0.8rem", color: "var(--text-secondary)" }}>
-          Version: {version ? unixToReadable(version) : "..."}
+          Version: {version || "…"}
         </p>
       </div>
     </div>

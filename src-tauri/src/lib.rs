@@ -1,7 +1,13 @@
 use chrono::Local;
+use chrono::Utc;
+use tauri_plugin_opener::OpenerExt;
 use rusqlite::Connection;
 use notify::Watcher;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, State};
@@ -1102,7 +1108,7 @@ fn save_akahu_credentials(app_id: String, user_token: String) -> Result<(), Stri
 
 #[tauri::command]
 fn get_app_version() -> String {
-    option_env!("BUILD_TIMESTAMP").unwrap_or("unknown").to_string()
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 #[tauri::command]
@@ -1129,6 +1135,325 @@ fn set_autofetch_setting(state: State<'_, AppState>, enabled: bool) -> Result<()
         .map_err(|e| e.to_string())?;
         Ok(())
     })
+}
+
+// ---------------------------------------------------------------------------
+// Backups (sub-phase 1)
+// ---------------------------------------------------------------------------
+//
+// Backups are point-in-time snapshots of the whole database, produced via
+// `VACUUM INTO` (a clean, compacted copy) and then gzipped to `.db.gz`.
+// They are stored LOCALLY (Application Support by default), deliberately NOT
+// in iCloud alongside the live DB — a backup's job is to survive data loss,
+// which means living on a different failure-domain than the primary. They are
+// per-machine and not synced. Retention is "keep last N" where N depends on
+// the configured frequency.
+
+const BACKUP_PREFIX: &str = "my_finances-";
+const BACKUP_SUFFIX: &str = ".db.gz";
+
+/// Settings surfaced to the frontend.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct BackupSettings {
+    frequency: String, // "off" | "daily" | "weekly" | "monthly"
+    last_backup_at: Option<String>, // ISO-8601 UTC, or None if never
+    backup_dir: String, // resolved absolute path actually in use
+    is_default_dir: bool, // true when no custom dir set (backup_dir is the default)
+}
+
+/// Resolve the backups directory. Honors a `backup_dir` setting if present and
+/// usable; otherwise falls back to the default `<app_support>/backups/`.
+/// Always returns a path (the default) even if the custom dir is invalid —
+/// callers that need it usable should `create_dir_all` before writing.
+fn resolve_backups_dir(state: &AppState) -> PathBuf {
+    // Try the custom setting first.
+    if let Ok(custom) = with_db_ro(state, |db| {
+        let v: Option<String> = db
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'backup_dir'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(v)
+    }) {
+        if let Some(p) = custom {
+            let pb = PathBuf::from(&p);
+            if pb.is_absolute() {
+                return pb;
+            }
+        }
+    }
+    // Default: <app support>/my_finances/backups/
+    let dir = dirs_next::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    dir.join("my_finances").join("backups")
+}
+
+/// Number of backups to retain for a given frequency.
+fn backup_keep_count(frequency: &str) -> usize {
+    match frequency {
+        "daily" => 30,
+        "weekly" => 12,
+        "monthly" => 24,
+        _ => 0, // "off" — don't prune
+    }
+}
+
+/// Seconds between backups for a given frequency.
+fn backup_interval_secs(frequency: &str) -> Option<i64> {
+    match frequency {
+        "daily" => Some(86_400),
+        "weekly" => Some(604_800),
+        "monthly" => Some(2_592_000), // 30 days
+        _ => None, // "off"
+    }
+}
+
+/// Snapshot the live DB to `target` via `VACUUM INTO` (clean, compacted copy).
+/// Opens the source read-only; VACUUM INTO does not mutate the source.
+fn snapshot_db(live_path: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+ let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(live_path, flags)
+        .map_err(|e| format!("Failed to open DB for snapshot: {}", e))?;
+    let target_str = target
+        .to_str()
+        .ok_or_else(|| "Backup temp path is not valid UTF-8".to_string())?;
+    conn.execute_batch(&format!("VACUUM INTO '{}';", target_str.replace('"', "")))
+        .map_err(|e| format!("VACUUM INTO failed: {}", e))?;
+    Ok(())
+}
+
+/// Gzip a source file into `target` (a `.db.gz`), then delete the source.
+fn gzip_file(src: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    let input = fs::read(src).map_err(|e| format!("Failed to read snapshot: {}", e))?;
+    let out = fs::File::create(target)
+        .map_err(|e| format!("Failed to create backup file: {}", e))?;
+    let mut enc = GzEncoder::new(out, Compression::default());
+    enc.write_all(&input)
+        .map_err(|e| format!("Failed to compress backup: {}", e))?;
+    enc.finish()
+        .map_err(|e| format!("Failed to finalize backup: {}", e))?;
+    let _ = fs::remove_file(src);
+    Ok(())
+}
+
+/// Delete the oldest backups beyond the keep-count for `frequency`.
+/// Only touches files matching `my_finances-*.db.gz`. Never deletes anything
+/// when frequency is "off".
+fn prune_backups(dir: &std::path::Path, frequency: &str) {
+    let keep = backup_keep_count(frequency);
+    if keep == 0 {
+        return;
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    // Collect (path, mtime) for files matching our backup naming.
+    let mut found: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = match entry.file_name().to_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if !name.starts_with(BACKUP_PREFIX) || !name.ends_with(BACKUP_SUFFIX) {
+            continue;
+        }
+        let mtime = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        found.push((entry.path(), mtime));
+    }
+    // Newest first by mtime.
+    found.sort_by(|a, b| b.1.cmp(&a.1));
+    for (path, _) in found.into_iter().skip(keep) {
+        let _ = fs::remove_file(&path);
+    }
+}
+
+/// Core backup routine. Snapshots the live DB, gzips it into the backups dir,
+/// records `last_backup_at`, and prunes. Used by both `do_backup_now` (forced)
+/// and `maybe_backup_on_launch` (interval-gated).
+///
+/// The DB is opened read-only for the snapshot (no lock contention with a
+/// simultaneous fetch); `local_lock` is taken only briefly to read/write the
+/// `last_backup_at` setting so the file copy+gzip don't block reads.
+fn run_backup(state: &AppState) -> Result<String, String> {
+    let dir = resolve_backups_dir(state);
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create backups dir: {}", e))?;
+
+    let ts = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let temp_db = dir.join(format!("{}{}.tmp", BACKUP_PREFIX, ts));
+    let gz_path = dir.join(format!("{}{}{}", BACKUP_PREFIX, ts, BACKUP_SUFFIX));
+
+    // Snapshot the live DB (read-only open of the source).
+    snapshot_db(&state.db_path, &temp_db)?;
+    // Compress and remove the temp.
+    gzip_file(&temp_db, &gz_path)?;
+
+    // Read frequency for pruning.
+    let frequency = with_db_ro(state, |db| {
+        let v: String = db
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'backup_frequency'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "off".to_string());
+        Ok(v)
+    })?;
+    prune_backups(&dir, &frequency);
+
+    // Record last_backup_at (UTC ISO-8601).
+    let now_iso = Utc::now().to_rfc3339();
+    with_db_rw(state, |db| {
+        db.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_backup_at', ?1)",
+            rusqlite::params![now_iso],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })?;
+
+    let name = gz_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    eprintln!("[my_finances] Backup written: {}", name);
+    Ok(name)
+}
+
+#[tauri::command]
+fn get_backup_settings(state: State<'_, AppState>) -> Result<BackupSettings, String> {
+    let (frequency, last_backup_at, custom_dir) = with_db_ro(&state, |db| {
+        let frequency: String = db
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'backup_frequency'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "off".to_string());
+        let last_backup_at: Option<String> = db
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'last_backup_at'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        let custom_dir: Option<String> = db
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'backup_dir'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok((frequency, last_backup_at, custom_dir))
+    })?;
+
+    let (backup_dir, is_default_dir) = match custom_dir {
+        Some(p) => {
+            let pb = PathBuf::from(&p);
+            if pb.is_absolute() {
+                (p, false)
+            } else {
+                (resolve_backups_dir(&state).to_string_lossy().to_string(), true)
+            }
+        }
+        None => (
+            resolve_backups_dir(&state).to_string_lossy().to_string(),
+            true,
+        ),
+    };
+
+    Ok(BackupSettings {
+        frequency,
+        last_backup_at,
+        backup_dir,
+        is_default_dir,
+    })
+}
+
+#[tauri::command]
+fn set_backup_frequency(state: State<'_, AppState>, frequency: String) -> Result<(), String> {
+    let f = match frequency.as_str() {
+        "off" | "daily" | "weekly" | "monthly" => frequency,
+        _ => return Err(format!("Invalid backup frequency: {}", frequency)),
+    };
+    with_db_rw(&state, |db| {
+        db.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('backup_frequency', ?1)",
+            rusqlite::params![f],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+}
+
+#[tauri::command]
+fn do_backup_now(state: State<'_, AppState>) -> Result<String, String> {
+    run_backup(&state)
+}
+
+/// On-launch check: if a frequency is set and enough time has elapsed since
+/// the last backup (or there has never been one), run a backup. No-ops when
+/// frequency is "off" or not yet due. Called from the frontend on first load,
+/// mirroring the autofetch pattern.
+#[tauri::command]
+fn maybe_backup_on_launch(state: State<'_, AppState>) -> Result<bool, String> {
+    let frequency = with_db_ro(&state, |db| {
+        let v: String = db
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'backup_frequency'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "off".to_string());
+        Ok(v)
+    })?;
+    let interval = match backup_interval_secs(&frequency) {
+        Some(s) => s,
+        None => return Ok(false), // "off"
+    };
+
+    let last_iso: Option<String> = with_db_ro(&state, |db| {
+        let v: Option<String> = db
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'last_backup_at'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(v)
+    })?;
+
+    let due = match last_iso {
+        None => true, // never backed up -> due immediately
+        Some(s) => match chrono::DateTime::parse_from_rfc3339(&s) {
+            Ok(t) => (Utc::now() - t.with_timezone(&Utc)).num_seconds() >= interval,
+            Err(_) => true, // unparseable timestamp -> treat as due
+        },
+    };
+
+    if !due {
+        return Ok(false);
+    }
+    run_backup(&state)?;
+    Ok(true)
+}
+
+/// Open the backups folder in Finder using the already-present opener plugin.
+#[tauri::command]
+fn open_backups_folder(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<(), String> {
+    let dir = resolve_backups_dir(&state);
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create backups dir: {}", e))?;
+    app.opener()
+        .open_path(dir.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| format!("Failed to open folder: {}", e))
 }
 
 fn recompute_total(conn: &Connection, today: &str) -> Result<(), rusqlite::Error> {
@@ -1321,6 +1646,11 @@ pub fn run() {
             get_app_version,
             get_autofetch_setting,
             set_autofetch_setting,
+            get_backup_settings,
+            set_backup_frequency,
+            do_backup_now,
+            maybe_backup_on_launch,
+            open_backups_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

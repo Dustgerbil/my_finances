@@ -61,6 +61,10 @@ export default function Dashboard() {
       const enabled = await invoke<boolean>("get_autofetch_setting").catch(() => false);
       setAutofetch(enabled);
 
+      // Kick off a backup if a frequency is set and one is due (fire-and-forget;
+      // mirrors the autofetch pattern). Runs in parallel with the fetch below.
+      invoke<boolean>("maybe_backup_on_launch").catch(() => {});
+
       if (enabled && !didAutofetch.current) {
         didAutofetch.current = true;
         const credsOk = await invoke<boolean>("has_akahu_credentials").catch(() => false);

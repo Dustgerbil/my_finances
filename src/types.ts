@@ -37,3 +37,10 @@ export interface AccountChange {
   change_amount: number | null;
   change_percent: number | null;
 }
+
+export interface BackupSettings {
+  frequency: string; // "off" | "daily" | "weekly" | "monthly"
+  last_backup_at: string | null; // ISO-8601 UTC, or null if never
+  backup_dir: string; // resolved absolute path in use
+  is_default_dir: boolean;
+}
