@@ -11,7 +11,7 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
-import type { AccountHistory, AccountChange } from "../types";
+import type { AccountHistory, AccountChange, DeletedValue } from "../types";
 
 export default function AccountDetail() {
   const { id } = useParams<{ id: string }>();
@@ -28,6 +28,10 @@ export default function AccountDetail() {
     type: "success" | "error";
     message: string;
   } | null>(null);
+
+  // Delete-last-value state: two-click confirm to avoid accidental deletes.
+  const [deleting, setDeleting] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
 
   const loadHistory = useCallback(async () => {
     if (!id) return;
@@ -92,6 +96,41 @@ export default function AccountDetail() {
       setAddStatus({ type: "error", message: `Error: ${err}` });
     } finally {
       setAdding(false);
+    }
+  };
+
+  const handleDeleteLastValue = async () => {
+    if (!id) return;
+    // Second click within the confirm window actually deletes.
+    if (!confirmingDelete) {
+      setConfirmingDelete(true);
+      // Auto-reset the confirm state after a few seconds.
+      setTimeout(() => setConfirmingDelete(false), 4000);
+      return;
+    }
+    setConfirmingDelete(false);
+    setDeleting(true);
+    setAddStatus(null);
+    try {
+      const deleted = await invoke<DeletedValue | null>(
+        "delete_last_manual_value",
+        { accountId: decodeURIComponent(id) },
+      );
+      if (deleted) {
+        setAddStatus({
+          type: "success",
+          message: `Deleted ${formatCurrency(deleted.balance)} from ${formatDate(
+            deleted.recorded_date,
+          )}`,
+        });
+      } else {
+        setAddStatus({ type: "error", message: "No values to delete" });
+      }
+      await loadHistory();
+    } catch (err) {
+      setAddStatus({ type: "error", message: `Error: ${err}` });
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -302,6 +341,23 @@ export default function AccountDetail() {
           >
             {adding ? "Saving..." : "Save"}
           </button>
+          {data.values.length > 0 && (
+            <button
+              className="btn"
+              onClick={handleDeleteLastValue}
+              disabled={deleting || adding}
+              style={{
+                color: confirmingDelete ? "var(--danger)" : undefined,
+                borderColor: confirmingDelete ? "var(--danger)" : undefined,
+              }}
+            >
+              {deleting
+                ? "Deleting..."
+                : confirmingDelete
+                ? "Click again to confirm"
+                : "Delete last value"}
+            </button>
+          )}
           {addStatus && (
             <span
               style={{

@@ -88,6 +88,14 @@ pub struct AddManualValueRequest {
     pub balance: f64,
 }
 
+/// Return value for `delete_last_manual_value`: describes the row that was
+/// removed, so the UI can confirm what was undone.
+#[derive(Debug, Serialize)]
+pub struct DeletedValue {
+    pub balance: f64,
+    pub recorded_date: String,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct AccountChange {
     pub period: String,
@@ -167,19 +175,28 @@ fn init_db(conn: &Connection) {
 /// This is the single place the iCloud decision lives; upgrading to the app's
 /// private ubiquity container (entitlement-gated) is a one-function change.
 fn resolve_db_path() -> PathBuf {
+    // Detect iCloud Drive (CloudDocs) presence. We check the CloudDocs *root*,
+    // not the `my_finances` subfolder — the subfolder is created by us (below)
+    // or by `migrate_legacy_into_icloud`, so checking for it would be a
+    // chicken-and-egg bug: it would never exist on first run, the app would
+    // fall back to the local path, and migration (which creates it) would
+    // never be invoked with an iCloud path.
     if let Some(home) = dirs_next::home_dir() {
-        let icloud_dir = home
+        let icloud_root = home
             .join("Library")
             .join("Mobile Documents")
-            .join("com~apple~CloudDocs")
-            .join("my_finances");
-        if icloud_dir.exists() {
+            .join("com~apple~CloudDocs");
+        if icloud_root.is_dir() {
+            let icloud_dir = icloud_root.join("my_finances");
+            // Ensure the app subfolder exists so the live DB and conflict
+            // copies have somewhere to live.
             std::fs::create_dir_all(&icloud_dir).ok();
             return icloud_dir.join("my_finances.db");
         }
     }
 
-    // Fallback: legacy local Application Support path.
+    // Fallback: legacy local Application Support path (used when iCloud Drive
+    // is not signed in or the CloudDocs folder is absent).
     let db_dir = dirs_next::data_dir().unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&db_dir).ok();
     db_dir.join("my_finances.db")
@@ -986,6 +1003,64 @@ fn add_manual_account_value(
     Ok(())
 }
 
+/// Delete the most-recently-added value row for a manual account (the row with
+/// the highest `id` for that account — i.e. the last one the user entered).
+/// Used to undo a typo. Recomputes virtual totals afterwards so cards/graphs
+/// reflect the deletion. Returns the deleted row so the UI can confirm what
+/// was removed, or `None` if the account had no values to delete.
+#[tauri::command]
+fn delete_last_manual_value(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Option<DeletedValue>, String> {
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    with_db_rw(&state, |db| {
+        // Verify it's a manual account.
+        let is_manual: bool = db
+            .query_row(
+                "SELECT is_manual != 0 FROM accounts WHERE id = ?1",
+                rusqlite::params![account_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Account not found: {}", e))?;
+
+        if !is_manual {
+            return Err("Can only delete values from manual accounts".to_string());
+        }
+
+        // Find the most-recently-inserted row (MAX(id)) for this account.
+        let row: Option<(i64, f64, String)> = db
+            .query_row(
+                "SELECT id, balance, recorded_date
+                 FROM account_values
+                 WHERE account_id = ?1
+                 ORDER BY id DESC
+                 LIMIT 1",
+                rusqlite::params![account_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok();
+
+        let Some((row_id, balance, recorded_date)) = row else {
+            return Ok(None); // nothing to delete
+        };
+
+        db.execute(
+            "DELETE FROM account_values WHERE id = ?1",
+            rusqlite::params![row_id],
+        )
+        .map_err(|e| e.to_string())?;
+
+        // Recalculate the virtual total so cards/graphs reflect the deletion.
+        recompute_total(db, &today).ok();
+
+        Ok(Some(DeletedValue {
+            balance,
+            recorded_date,
+        }))
+    })
+}
+
 #[tauri::command]
 fn get_account_changes(
     state: State<'_, AppState>,
@@ -1064,7 +1139,13 @@ fn get_account_changes(
             let change = match (current_balance, prev_balance) {
                 (Some(cur), Some(prev)) if prev != 0.0 => {
                     let amount = cur - prev;
-                    let percent = (amount / prev) * 100.0;
+                    // Use the magnitude of the previous balance as the base so
+                    // that liabilities (stored as negative balances) show a
+                    // percentage whose sign matches the dollar change: paying
+                    // down a debt is an improvement (positive change), not a
+                    // negative one. For assets (prev > 0) `prev.abs()` is a
+                    // no-op, so their displayed percentage is unchanged.
+                    let percent = (amount / prev.abs()) * 100.0;
                     (Some(amount), Some(percent))
                 }
                 (Some(cur), Some(prev)) => (Some(cur - prev), None),
@@ -1641,6 +1722,7 @@ pub fn run() {
             toggle_ignore_account,
             add_manual_account,
             add_manual_account_value,
+            delete_last_manual_value,
             has_akahu_credentials,
             save_akahu_credentials,
             get_app_version,

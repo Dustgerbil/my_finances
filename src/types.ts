@@ -15,6 +15,12 @@ export interface AccountValue {
   recorded_date: string;
 }
 
+/** Return value of `delete_last_manual_value`: the row that was removed. */
+export interface DeletedValue {
+  balance: number;
+  recorded_date: string;
+}
+
 export interface AccountSummary {
   account: Account;
   latest_balance: number | null;
