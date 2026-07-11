@@ -269,6 +269,12 @@ body {
   font-weight: 700;
 }
 
+.detail-stat .stat-date {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
 .stat-current {
   color: var(--accent);
 }

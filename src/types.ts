@@ -33,7 +33,9 @@ export interface AccountHistory {
   values: AccountValue[];
   current_balance: number | null;
   min_balance: number | null;
+  min_balance_date: string | null;
   max_balance: number | null;
+  max_balance_date: string | null;
 }
 
 export interface AccountChange {

@@ -264,12 +264,18 @@ export default function AccountDetail() {
           <div className="stat-value stat-min">
             {formatCurrency(data.min_balance)}
           </div>
+          {data.min_balance_date && (
+            <div className="stat-date">{formatDate(data.min_balance_date)}</div>
+          )}
         </div>
         <div className="detail-stat">
           <div className="stat-label">Maximum</div>
           <div className="stat-value stat-max">
             {formatCurrency(data.max_balance)}
           </div>
+          {data.max_balance_date && (
+            <div className="stat-date">{formatDate(data.max_balance_date)}</div>
+          )}
         </div>
       </div>
 

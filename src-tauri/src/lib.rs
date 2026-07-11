@@ -72,7 +72,9 @@ pub struct AccountHistory {
     pub values: Vec<AccountValue>,
     pub current_balance: Option<f64>,
     pub min_balance: Option<f64>,
+    pub min_balance_date: Option<String>,
     pub max_balance: Option<f64>,
+    pub max_balance_date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,8 +297,8 @@ fn merge_conflict_copies(conn: &Connection, live_path: &std::path::Path) {
 /// rows live in `account_values` and are unioned like every other row (live's
 /// value for a given date wins on collision; conflict's is added where live has
 /// none). We deliberately do NOT recompute historical totals here: `recompute_total`
-/// derives the total from each account's *latest* balance (MAX(id) across all
-/// dates), not a date-specific balance, so recomputing a historical date would
+/// derives the total from each account's *latest* balance across all dates,
+/// not a date-specific balance, so recomputing a historical date would
 /// store today's total under that past date and corrupt the graph. Today's total
 /// is recomputed fresh by the normal fetch/toggle/manual write paths that call
 /// this merge via `open_db_rw`.
@@ -677,6 +679,7 @@ async fn fetch_akahu_balances(state: State<'_, AppState>) -> Result<String, Stri
 
     // Save to database (tight write critical section; no lock held during the network above).
     with_db_rw(&state, |db| {
+        let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
         for acc in &nzd_accounts {
             let inst_name = acc
                 .connection
@@ -698,7 +701,7 @@ async fn fetch_akahu_balances(state: State<'_, AppState>) -> Result<String, Stri
                 .unwrap_or(0.0);
 
             // Upsert account
-            db.execute(
+            tx.execute(
                 "INSERT INTO accounts (id, name, type, institution, currency, is_manual, is_ignored)
                  VALUES (?1, ?2, ?3, ?4, 'NZD', 0, 0)
                  ON CONFLICT(id) DO UPDATE SET
@@ -713,38 +716,29 @@ async fn fetch_akahu_balances(state: State<'_, AppState>) -> Result<String, Stri
             // Upsert today's account value (idempotent per (account, day)) so a
             // same-day re-fetch on another machine overwrites rather than
             // duplicating — keeps the merge lossless even without a lock.
-            db.execute(
-                "DELETE FROM account_values WHERE account_id = ?1 AND recorded_date = ?2",
-                rusqlite::params![acc.id, today],
-            )
-            .map_err(|e| e.to_string())?;
-            db.execute(
-                "INSERT INTO account_values (account_id, balance, recorded_date)
-                 VALUES (?1, ?2, ?3)",
-                rusqlite::params![acc.id, balance, today],
-            )
-            .map_err(|e| e.to_string())?;
+            upsert_daily_account_value(&tx, &acc.id, balance, &today)
+                .map_err(|e| e.to_string())?;
         }
 
         // ---- Virtual total account ----
-        recompute_total(db, &today).map_err(|e| e.to_string())?;
+        recompute_total(&tx, &today).map_err(|e| e.to_string())?;
         // ---- End virtual total ----
 
         // Log the fetch (idempotent: same-day re-fetch on another machine
         // must not add a duplicate fetch_log row, which would make the
         // fetch-log UNION merge misbehave).
-        db.execute(
+        tx.execute(
             "DELETE FROM fetch_log WHERE fetched_at = ?1",
             rusqlite::params![today],
         )
         .map_err(|e| e.to_string())?;
-        db.execute(
+        tx.execute(
             "INSERT INTO fetch_log (fetched_at) VALUES (?1)",
             rusqlite::params![today],
         )
         .map_err(|e| e.to_string())?;
 
-        Ok(())
+        tx.commit().map_err(|e| e.to_string())
     })?;
 
     Ok(format!("Fetched {} NZD accounts", nzd_accounts.len()))
@@ -761,10 +755,15 @@ fn get_accounts_summary(state: State<'_, AppState>) -> Result<Vec<AccountSummary
                  FROM accounts a
                  LEFT JOIN (
                      SELECT account_id, balance, recorded_date
-                     FROM account_values
-                     WHERE id IN (
-                         SELECT MAX(id) FROM account_values GROUP BY account_id
+                     FROM (
+                         SELECT account_id, balance, recorded_date,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY account_id
+                                    ORDER BY recorded_date DESC, id DESC
+                                ) AS rn
+                         FROM account_values
                      )
+                     WHERE rn = 1
                  ) av ON a.id = av.account_id
                  WHERE a.is_ignored = 0
                  ORDER BY CASE WHEN a.id = '__total__' THEN 0
@@ -832,7 +831,7 @@ fn get_account_history(
                 "SELECT id, account_id, balance, recorded_date
                  FROM account_values
                  WHERE account_id = ?1
-                 ORDER BY recorded_date ASC",
+                 ORDER BY recorded_date ASC, id ASC",
             )
             .map_err(|e| e.to_string())?;
 
@@ -853,6 +852,28 @@ fn get_account_history(
         let min_balance = values.iter().map(|v| v.balance).fold(f64::INFINITY, f64::min);
         let max_balance = values.iter().map(|v| v.balance).fold(f64::NEG_INFINITY, f64::max);
 
+        // Date the min/max value last occurred. `values` is ordered ASC by
+        // date, so iterating and keeping the last match gives the most recent
+        // date on which that extreme balance was recorded (ties included).
+        let min_balance_date = if min_balance.is_finite() {
+            values
+                .iter()
+                .rev()
+                .find(|v| v.balance == min_balance)
+                .map(|v| v.recorded_date.clone())
+        } else {
+            None
+        };
+        let max_balance_date = if max_balance.is_finite() {
+            values
+                .iter()
+                .rev()
+                .find(|v| v.balance == max_balance)
+                .map(|v| v.recorded_date.clone())
+        } else {
+            None
+        };
+
         Ok(AccountHistory {
             account,
             values,
@@ -862,11 +883,13 @@ fn get_account_history(
             } else {
                 None
             },
+            min_balance_date,
             max_balance: if max_balance.is_finite() {
                 Some(max_balance)
             } else {
                 None
             },
+            max_balance_date,
         })
     })
 }
@@ -911,8 +934,9 @@ fn toggle_ignore_account(state: State<'_, AppState>, account_id: String) -> Resu
 
     let today = Local::now().format("%Y-%m-%d").to_string();
     let new_value = with_db_rw(&state, |db| {
+        let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
         // Toggle the is_ignored flag
-        db.execute(
+        tx.execute(
             "UPDATE accounts SET is_ignored = CASE WHEN is_ignored = 0 THEN 1 ELSE 0 END
              WHERE id = ?1",
             rusqlite::params![account_id],
@@ -920,7 +944,7 @@ fn toggle_ignore_account(state: State<'_, AppState>, account_id: String) -> Resu
         .map_err(|e| e.to_string())?;
 
         // Return the new value
-        let new_value: bool = db
+        let new_value: bool = tx
             .query_row(
                 "SELECT is_ignored != 0 FROM accounts WHERE id = ?1",
                 rusqlite::params![account_id],
@@ -929,7 +953,8 @@ fn toggle_ignore_account(state: State<'_, AppState>, account_id: String) -> Resu
             .map_err(|e| e.to_string())?;
 
         // Recalculate the virtual total
-        recompute_total(db, &today).ok();
+        recompute_total(&tx, &today).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
 
         Ok(new_value)
     })?;
@@ -974,8 +999,9 @@ fn add_manual_account_value(
 ) -> Result<(), String> {
     let today = Local::now().format("%Y-%m-%d").to_string();
     with_db_rw(&state, |db| {
+        let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
         // Verify it's a manual account
-        let is_manual: bool = db
+        let is_manual: bool = tx
             .query_row(
                 "SELECT is_manual != 0 FROM accounts WHERE id = ?1",
                 rusqlite::params![request.account_id],
@@ -987,15 +1013,15 @@ fn add_manual_account_value(
             return Err("Can only add values to manual accounts".to_string());
         }
 
-        db.execute(
-            "INSERT INTO account_values (account_id, balance, recorded_date)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![request.account_id, request.balance, today],
-        )
-        .map_err(|e| e.to_string())?;
+        // A manual account follows the same one-value-per-account-per-day rule
+        // as fetched and virtual accounts. A second save today replaces the
+        // earlier value instead of creating a duplicate chart point.
+        upsert_daily_account_value(&tx, &request.account_id, request.balance, &today)
+            .map_err(|e| e.to_string())?;
 
         // Recalculate the virtual total
-        recompute_total(db, &today).ok();
+        recompute_total(&tx, &today).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
 
         Ok(())
     })?;
@@ -1015,8 +1041,9 @@ fn delete_last_manual_value(
 ) -> Result<Option<DeletedValue>, String> {
     let today = Local::now().format("%Y-%m-%d").to_string();
     with_db_rw(&state, |db| {
+        let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
         // Verify it's a manual account.
-        let is_manual: bool = db
+        let is_manual: bool = tx
             .query_row(
                 "SELECT is_manual != 0 FROM accounts WHERE id = ?1",
                 rusqlite::params![account_id],
@@ -1029,7 +1056,7 @@ fn delete_last_manual_value(
         }
 
         // Find the most-recently-inserted row (MAX(id)) for this account.
-        let row: Option<(i64, f64, String)> = db
+        let row: Option<(i64, f64, String)> = tx
             .query_row(
                 "SELECT id, balance, recorded_date
                  FROM account_values
@@ -1045,14 +1072,15 @@ fn delete_last_manual_value(
             return Ok(None); // nothing to delete
         };
 
-        db.execute(
+        tx.execute(
             "DELETE FROM account_values WHERE id = ?1",
             rusqlite::params![row_id],
         )
         .map_err(|e| e.to_string())?;
 
         // Recalculate the virtual total so cards/graphs reflect the deletion.
-        recompute_total(db, &today).ok();
+        recompute_total(&tx, &today).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
 
         Ok(Some(DeletedValue {
             balance,
@@ -1073,7 +1101,7 @@ fn get_account_changes(
                 "SELECT balance
                  FROM account_values
                  WHERE account_id = ?1
-                 ORDER BY recorded_date DESC
+                 ORDER BY recorded_date DESC, id DESC
                  LIMIT 1",
                 rusqlite::params![account_id],
                 |row| row.get(0),
@@ -1125,7 +1153,7 @@ fn get_account_changes(
                             "SELECT balance, recorded_date
                              FROM account_values
                              WHERE account_id = ?1 AND recorded_date <= ?2
-                             ORDER BY recorded_date DESC
+                             ORDER BY recorded_date DESC, id DESC
                              LIMIT 1",
                             rusqlite::params![account_id, lb],
                             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -1555,9 +1583,16 @@ fn recompute_total(conn: &Connection, today: &str) -> Result<(), rusqlite::Error
     let total: f64 = conn.query_row(
         "SELECT COALESCE(SUM(balance), 0)
          FROM (
-             SELECT balance
-             FROM account_values
-             WHERE id IN (SELECT MAX(id) FROM account_values GROUP BY account_id)
+             SELECT balance, account_id
+             FROM (
+                 SELECT balance, account_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY account_id
+                            ORDER BY recorded_date DESC, id DESC
+                        ) AS rn
+                 FROM account_values
+             )
+             WHERE rn = 1
                AND account_id IN (
                    SELECT id FROM accounts WHERE is_ignored = 0 AND id NOT IN ('__total__', '__assets_total__', '__liabilities_total__')
                )
@@ -1571,9 +1606,16 @@ fn recompute_total(conn: &Connection, today: &str) -> Result<(), rusqlite::Error
     let assets: f64 = conn.query_row(
         "SELECT COALESCE(SUM(balance), 0)
          FROM (
-             SELECT balance
-             FROM account_values
-             WHERE id IN (SELECT MAX(id) FROM account_values GROUP BY account_id)
+             SELECT balance, account_id
+             FROM (
+                 SELECT balance, account_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY account_id
+                            ORDER BY recorded_date DESC, id DESC
+                        ) AS rn
+                 FROM account_values
+             )
+             WHERE rn = 1
                AND account_id IN (
                    SELECT id FROM accounts WHERE is_ignored = 0 AND id NOT IN ('__total__', '__assets_total__', '__liabilities_total__')
                )
@@ -1588,9 +1630,16 @@ fn recompute_total(conn: &Connection, today: &str) -> Result<(), rusqlite::Error
     let liabilities: f64 = conn.query_row(
         "SELECT COALESCE(SUM(balance), 0)
          FROM (
-             SELECT balance
-             FROM account_values
-             WHERE id IN (SELECT MAX(id) FROM account_values GROUP BY account_id)
+             SELECT balance, account_id
+             FROM (
+                 SELECT balance, account_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY account_id
+                            ORDER BY recorded_date DESC, id DESC
+                        ) AS rn
+                 FROM account_values
+             )
+             WHERE rn = 1
                AND account_id IN (
                    SELECT id FROM accounts WHERE is_ignored = 0 AND id NOT IN ('__total__', '__assets_total__', '__liabilities_total__')
                )
@@ -1614,14 +1663,26 @@ fn upsert_daily_total(
     balance: f64,
     today: &str,
 ) -> Result<(), rusqlite::Error> {
+    upsert_daily_account_value(conn, account_id, balance, today)
+}
+
+/// Store exactly one value for an account on a given day. This is shared by
+/// fetched, manual, and virtual accounts so every write path has identical
+/// idempotency semantics.
+fn upsert_daily_account_value(
+    conn: &Connection,
+    account_id: &str,
+    balance: f64,
+    recorded_date: &str,
+) -> Result<(), rusqlite::Error> {
     conn.execute(
         "DELETE FROM account_values WHERE account_id = ?1 AND recorded_date = ?2",
-        rusqlite::params![account_id, today],
+        rusqlite::params![account_id, recorded_date],
     )?;
     conn.execute(
         "INSERT INTO account_values (account_id, balance, recorded_date)
          VALUES (?1, ?2, ?3)",
-        rusqlite::params![account_id, balance, today],
+        rusqlite::params![account_id, balance, recorded_date],
     )?;
     Ok(())
 }
@@ -1647,6 +1708,61 @@ fn seed_total_if_missing(conn: &Connection) {
     }
 
     recompute_total(conn, &today).ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn);
+        conn.execute(
+            "INSERT INTO accounts (id, name, type, institution, currency, is_manual, is_ignored)
+             VALUES ('account-1', 'Test', '', '', 'NZD', 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn daily_value_upsert_replaces_same_day_value() {
+        let conn = test_db();
+        upsert_daily_account_value(&conn, "account-1", 10.0, "2026-07-12").unwrap();
+        upsert_daily_account_value(&conn, "account-1", 20.0, "2026-07-12").unwrap();
+
+        let (count, balance): (i64, f64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(balance) FROM account_values
+                 WHERE account_id = 'account-1' AND recorded_date = '2026-07-12'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(balance, 20.0);
+    }
+
+    #[test]
+    fn totals_use_latest_date_not_highest_insert_id() {
+        let conn = test_db();
+        // Simulate conflict merging: an older row is inserted after the current
+        // row and therefore receives the larger auto-increment id.
+        upsert_daily_account_value(&conn, "account-1", 200.0, "2026-07-12").unwrap();
+        upsert_daily_account_value(&conn, "account-1", 100.0, "2026-01-01").unwrap();
+
+        recompute_total(&conn, "2026-07-12").unwrap();
+        let total: f64 = conn
+            .query_row(
+                "SELECT balance FROM account_values
+                 WHERE account_id = '__total__' AND recorded_date = '2026-07-12'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 200.0);
+    }
 }
 
 // ---------------------------------------------------------------------------
