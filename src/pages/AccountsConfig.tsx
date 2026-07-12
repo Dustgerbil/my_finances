@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import type { Account } from "../types";
+import { formatAccountType } from "../format";
 
 export default function AccountsConfig() {
   const navigate = useNavigate();
@@ -78,8 +79,8 @@ export default function AccountsConfig() {
 
   return (
     <div>
-      <button className="btn btn-back" onClick={() => navigate("/")}>
-        ← Back to Dashboard
+      <button className="btn btn-back" onClick={() => navigate("/settings")}>
+        ← Back to Settings
       </button>
 
       <div className="config-header">
@@ -155,7 +156,7 @@ export default function AccountsConfig() {
                       <div className="account-name">{acc.name}</div>
                       <div className="account-institution">
                         {acc.institution}
-                        {acc.type ? ` · ${acc.type}` : ""}
+                        {acc.type ? ` · ${formatAccountType(acc.type)}` : ""}
                       </div>
                     </div>
                     <label className="toggle">
@@ -183,7 +184,7 @@ export default function AccountsConfig() {
                       <div className="account-name">{acc.name}</div>
                       <div className="account-institution">
                         {acc.institution}
-                        {acc.type ? ` · ${acc.type}` : ""}
+                        {acc.type ? ` · ${formatAccountType(acc.type)}` : ""}
                       </div>
                     </div>
                     <label className="toggle">

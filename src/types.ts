@@ -52,3 +52,14 @@ export interface BackupSettings {
   backup_dir: string; // resolved absolute path in use
   is_default_dir: boolean;
 }
+
+export interface DataHealth {
+  db_path: string;
+  is_icloud: boolean;
+  integrity_status: string;
+  last_fetch_at: string | null;
+  last_backup_at: string | null;
+  account_count: number;
+  value_count: number;
+  pending_conflict_copies: number;
+}

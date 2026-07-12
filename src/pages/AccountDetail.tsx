@@ -12,6 +12,30 @@ import {
   ResponsiveContainer,
 } from "recharts";
 import type { AccountHistory, AccountChange, DeletedValue } from "../types";
+import { formatAccountType } from "../format";
+
+type ChartRange = "1m" | "6m" | "1y" | "all";
+
+const chartRanges: { value: ChartRange; label: string; months: number | null }[] = [
+  { value: "1m", label: "1M", months: 1 },
+  { value: "6m", label: "6M", months: 6 },
+  { value: "1y", label: "1Y", months: 12 },
+  { value: "all", label: "All", months: null },
+];
+
+function subtractMonths(dateString: string, months: number) {
+  const date = new Date(`${dateString}T00:00:00`);
+  const originalDay = date.getDate();
+  date.setDate(1);
+  date.setMonth(date.getMonth() - months);
+  const lastDay = new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
+  date.setDate(Math.min(originalDay, lastDay));
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+}
 
 export default function AccountDetail() {
   const { id } = useParams<{ id: string }>();
@@ -20,6 +44,7 @@ export default function AccountDetail() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [changes, setChanges] = useState<AccountChange[]>([]);
+  const [chartRange, setChartRange] = useState<ChartRange>("1y");
 
   // Add value form state
   const [addValue, setAddValue] = useState("");
@@ -172,11 +197,21 @@ export default function AccountDetail() {
     );
   }
 
-  const chartData = data.values.map((v) => ({
-    date: v.recorded_date,
-    balance: v.balance,
-    label: formatDate(v.recorded_date),
-  }));
+  const latestRecordedDate = data.values.reduce(
+    (latest, value) => value.recorded_date > latest ? value.recorded_date : latest,
+    "",
+  );
+  const selectedRange = chartRanges.find((range) => range.value === chartRange)!;
+  const cutoffDate = selectedRange.months != null && latestRecordedDate
+    ? subtractMonths(latestRecordedDate, selectedRange.months)
+    : null;
+  const chartData = data.values
+    .filter((value) => cutoffDate == null || value.recorded_date >= cutoffDate)
+    .map((v) => ({
+      date: v.recorded_date,
+      balance: v.balance,
+      label: formatDate(v.recorded_date),
+    }));
 
   return (
     <div>
@@ -197,14 +232,29 @@ export default function AccountDetail() {
           </h1>
           <p style={{ color: "var(--text-secondary)", fontSize: "0.9rem" }}>
             {data.account.institution}
-            {data.account.type ? ` · ${data.account.type}` : ""}
+            {data.account.type ? ` · ${formatAccountType(data.account.type)}` : ""}
           </p>
         </div>
       </div>
 
       {data.values.length > 0 ? (
         <div className="chart-container">
-          <h3>Balance over time</h3>
+          <div className="chart-header">
+            <h3>Balance over time</h3>
+            <div className="chart-range" aria-label="Chart date range">
+              {chartRanges.map((range) => (
+                <button
+                  key={range.value}
+                  type="button"
+                  className={chartRange === range.value ? "active" : ""}
+                  aria-pressed={chartRange === range.value}
+                  onClick={() => setChartRange(range.value)}
+                >
+                  {range.label}
+                </button>
+              ))}
+            </div>
+          </div>
           <ResponsiveContainer width="100%" height={300}>
             <LineChart data={chartData}>
               <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />

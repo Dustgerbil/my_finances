@@ -1,7 +1,8 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
-import type { BackupSettings } from "../types";
+import { confirm, open } from "@tauri-apps/plugin-dialog";
+import type { BackupSettings, DataHealth } from "../types";
 
 export default function Settings() {
   const navigate = useNavigate();
@@ -14,6 +15,11 @@ export default function Settings() {
   const [backup, setBackup] = useState<BackupSettings | null>(null);
   const [backupLoading, setBackupLoading] = useState(false);
   const [backingUp, setBackingUp] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+  const [restorePath, setRestorePath] = useState<string | null>(null);
+  const [health, setHealth] = useState<DataHealth | null>(null);
+  const [healthLoading, setHealthLoading] = useState(true);
+  const [healthError, setHealthError] = useState<string | null>(null);
   const [status, setStatus] = useState<{
     type: "success" | "error";
     message: string;
@@ -41,6 +47,22 @@ export default function Settings() {
   useEffect(() => {
     loadBackupSettings();
   }, []);
+
+  const loadHealth = useCallback(async () => {
+    setHealthLoading(true);
+    setHealthError(null);
+    try {
+      setHealth(await invoke<DataHealth>("get_data_health"));
+    } catch (err) {
+      setHealthError(`Could not check data health: ${err}`);
+    } finally {
+      setHealthLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadHealth();
+  }, [loadHealth]);
 
   const handleFrequencyChange = async (frequency: string) => {
     const prev = backup;
@@ -75,6 +97,39 @@ export default function Settings() {
     }
   };
 
+  const handleChooseRestore = async () => {
+    const selected = await open({
+      multiple: false,
+      title: "Choose a My Finances backup",
+      filters: [{ name: "My Finances backup", extensions: ["gz"] }],
+    });
+    if (typeof selected === "string") setRestorePath(selected);
+  };
+
+  const handleRestore = async () => {
+    if (!restorePath) return;
+    const confirmed = await confirm(
+      "A safety backup of the current database will be created first.",
+      { title: "Restore this backup?", kind: "warning" },
+    );
+    if (!confirmed) return;
+    setRestoring(true);
+    setStatus(null);
+    try {
+      const safetyBackup = await invoke<string>("restore_backup", { backupPath: restorePath });
+      setStatus({
+        type: "success",
+        message: `Backup restored. Pre-restore safety backup: ${safetyBackup}`,
+      });
+      setRestorePath(null);
+      loadBackupSettings();
+    } catch (err) {
+      setStatus({ type: "error", message: `Restore failed: ${err}` });
+    } finally {
+      setRestoring(false);
+    }
+  };
+
   const formatBackupTime = (iso: string | null) => {
     if (!iso) return "Never";
     const d = new Date(iso);
@@ -86,6 +141,12 @@ export default function Settings() {
       hour: "2-digit",
       minute: "2-digit",
     });
+  };
+
+  const formatHealthDate = (value: string | null, dateOnly = false) => {
+    if (!value) return "Never";
+    const date = new Date(dateOnly ? `${value}T00:00:00` : value);
+    return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
   };
 
   const handleSave = async () => {
@@ -134,6 +195,18 @@ export default function Settings() {
       {status && (
         <div className={`status status-${status.type}`}>{status.message}</div>
       )}
+
+      <div className="card config-item">
+        <div className="config-item-info">
+          <div className="account-name">Accounts Configuration</div>
+          <div className="account-institution">
+            Choose visible accounts and add manual accounts
+          </div>
+        </div>
+        <button className="btn" onClick={() => navigate("/config")}>
+          Manage accounts
+        </button>
+      </div>
 
       <div className="card add-manual-form">
         <h3>Akahu Credentials</h3>
@@ -232,7 +305,79 @@ export default function Settings() {
             Open backups folder
           </button>
         </div>
+
+        <div className="restore-section">
+          <h4>Restore a backup</h4>
+          <p>
+            The selected backup is checked before it replaces the current database.
+            A fresh safety backup is created automatically.
+          </p>
+          <div className="restore-actions">
+            <button className="btn" onClick={handleChooseRestore} disabled={restoring}>
+              Choose backup…
+            </button>
+            {restorePath && (
+              <button className="btn btn-danger" onClick={handleRestore} disabled={restoring}>
+                {restoring ? "Restoring…" : "Restore selected backup"}
+              </button>
+            )}
+          </div>
+          {restorePath && <div className="restore-path">{restorePath}</div>}
+        </div>
       </div>
+
+      <section className="card data-health" aria-labelledby="data-health-title">
+        <div className="data-health-header">
+          <div>
+            <h2 id="data-health-title">Data Health</h2>
+            <p>Database, backup, and iCloud synchronization status</p>
+          </div>
+          <button className="btn" onClick={loadHealth} disabled={healthLoading}>
+            {healthLoading ? "Checking…" : "Refresh"}
+          </button>
+        </div>
+
+        {healthError ? (
+          <div className="status status-error">{healthError}</div>
+        ) : health ? (
+          <div className="data-health-grid">
+            <div className="health-item">
+              <span>Database integrity</span>
+              <strong className={health.integrity_status === "ok" ? "health-good" : "health-bad"}>
+                {health.integrity_status === "ok" ? "Healthy" : health.integrity_status}
+              </strong>
+            </div>
+            <div className="health-item">
+              <span>Storage</span>
+              <strong>{health.is_icloud ? "iCloud Drive" : "Local only"}</strong>
+            </div>
+            <div className="health-item">
+              <span>Last successful fetch</span>
+              <strong>{formatHealthDate(health.last_fetch_at, true)}</strong>
+            </div>
+            <div className="health-item">
+              <span>Last backup</span>
+              <strong>{formatHealthDate(health.last_backup_at)}</strong>
+            </div>
+            <div className="health-item">
+              <span>Accounts / values</span>
+              <strong>{health.account_count} / {health.value_count}</strong>
+            </div>
+            <div className="health-item">
+              <span>Pending conflict copies</span>
+              <strong className={health.pending_conflict_copies === 0 ? "health-good" : "health-warning"}>
+                {health.pending_conflict_copies}
+              </strong>
+            </div>
+            <div className="health-path">
+              <span>Database location</span>
+              <code>{health.db_path}</code>
+            </div>
+          </div>
+        ) : (
+          <p>Checking database…</p>
+        )}
+      </section>
 
       <div className="card" style={{ marginTop: "16px", textAlign: "center" }}>
         <p style={{ fontSize: "0.8rem", color: "var(--text-secondary)" }}>

@@ -115,11 +115,21 @@ body {
 .account-card {
   cursor: pointer;
   transition: box-shadow 0.2s, transform 0.1s;
+  width: 100%;
+  border: 1px solid var(--border);
+  color: inherit;
+  font: inherit;
+  text-align: left;
 }
 
 .account-card:hover {
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
   transform: translateY(-1px);
+}
+
+.account-card:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .account-card .account-name {
@@ -295,10 +305,52 @@ body {
   border-radius: var(--radius);
 }
 
+.chart-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
 .chart-container h3 {
   font-size: 0.9rem;
   color: var(--text-secondary);
-  margin-bottom: 12px;
+  margin: 0;
+}
+
+.chart-range {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+}
+
+.chart-range button {
+  border: 0;
+  border-radius: 5px;
+  padding: 5px 9px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.chart-range button:hover {
+  color: var(--text);
+}
+
+.chart-range button.active {
+  background: var(--accent);
+  color: white;
+}
+
+.chart-range button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 /* Config page */
@@ -554,4 +606,107 @@ body {
 /* Negative balance account card */
 .account-card.negative .account-balance {
   color: var(--danger);
+}
+
+/* Backup restore */
+.restore-section {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.restore-section h4 {
+  margin-bottom: 4px;
+}
+
+.restore-section p,
+.restore-path {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.restore-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.restore-path {
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+}
+
+.btn-danger {
+  background: var(--danger);
+  color: white;
+}
+
+/* Settings: data health */
+.data-health {
+  margin-top: 32px;
+  padding: 16px;
+}
+
+.data-health-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.data-health-header h2 {
+  font-size: 1.1rem;
+}
+
+.data-health-header p,
+.health-item span,
+.health-path span {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.data-health-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 24px;
+}
+
+.health-item,
+.health-path {
+  display: flex;
+  flex-direction: column;
+}
+
+.health-item strong {
+  font-size: 0.9rem;
+}
+
+.health-good {
+  color: var(--success);
+}
+
+.health-warning {
+  color: #b45309;
+}
+
+.health-bad {
+  color: var(--danger);
+}
+
+.health-path {
+  grid-column: 1 / -1;
+}
+
+.health-path code {
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+  font-size: 0.75rem;
+}
+
+@media (max-width: 600px) {
+  .data-health-grid {
+    grid-template-columns: 1fr;
+  }
 }

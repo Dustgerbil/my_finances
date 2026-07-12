@@ -4,6 +4,7 @@ use tauri_plugin_opener::OpenerExt;
 use rusqlite::Connection;
 use notify::Watcher;
 use flate2::write::GzEncoder;
+use flate2::read::GzDecoder;
 use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -1270,6 +1271,18 @@ struct BackupSettings {
     is_default_dir: bool, // true when no custom dir set (backup_dir is the default)
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct DataHealth {
+    db_path: String,
+    is_icloud: bool,
+    integrity_status: String,
+    last_fetch_at: Option<String>,
+    last_backup_at: Option<String>,
+    account_count: i64,
+    value_count: i64,
+    pending_conflict_copies: usize,
+}
+
 /// Resolve the backups directory. Honors a `backup_dir` setting if present and
 /// usable; otherwise falls back to the default `<app_support>/backups/`.
 /// Always returns a path (the default) even if the custom dir is invalid —
@@ -1382,6 +1395,50 @@ fn prune_backups(dir: &std::path::Path, frequency: &str) {
     }
 }
 
+fn count_conflict_copies(live_path: &std::path::Path) -> usize {
+    let Some(dir) = live_path.parent() else { return 0 };
+    let Some(live_name) = live_path.file_name().and_then(|name| name.to_str()) else { return 0 };
+    let stem = live_name.trim_end_matches(".db");
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry.file_name().to_str().is_some_and(|name| {
+                        name != live_name && name.starts_with(stem) && name.ends_with(".db")
+                    })
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn validate_restored_db(path: &std::path::Path) -> Result<(), String> {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)
+        .map_err(|e| format!("Restored file is not a readable SQLite database: {}", e))?;
+    let integrity: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|e| format!("Could not validate restored database: {}", e))?;
+    if integrity != "ok" {
+        return Err(format!("Restored database failed integrity check: {}", integrity));
+    }
+    for table in ["accounts", "account_values", "fetch_log", "settings"] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                rusqlite::params![table],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !exists {
+            return Err(format!("Restored database is missing required table '{}'", table));
+        }
+    }
+    Ok(())
+}
+
 /// Core backup routine. Snapshots the live DB, gzips it into the backups dir,
 /// records `last_backup_at`, and prunes. Used by both `do_backup_now` (forced)
 /// and `maybe_backup_on_launch` (interval-gated).
@@ -1487,6 +1544,50 @@ fn get_backup_settings(state: State<'_, AppState>) -> Result<BackupSettings, Str
 }
 
 #[tauri::command]
+fn get_data_health(state: State<'_, AppState>) -> Result<DataHealth, String> {
+    let (integrity_status, last_fetch_at, last_backup_at, account_count, value_count) =
+        with_db_ro(&state, |db| {
+            let integrity_status: String = db
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .map_err(|e| e.to_string())?;
+            let last_fetch_at = db
+                .query_row("SELECT MAX(fetched_at) FROM fetch_log", [], |row| row.get(0))
+                .map_err(|e| e.to_string())?;
+            let last_backup_at = db
+                .query_row(
+                    "SELECT value FROM settings WHERE key = 'last_backup_at'",
+                    [],
+                    |row| row.get(0),
+                )
+                .ok();
+            let account_count = db
+                .query_row(
+                    "SELECT COUNT(*) FROM accounts
+                     WHERE id NOT IN ('__total__', '__assets_total__', '__liabilities_total__')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            let value_count = db
+                .query_row("SELECT COUNT(*) FROM account_values", [], |row| row.get(0))
+                .map_err(|e| e.to_string())?;
+            Ok((integrity_status, last_fetch_at, last_backup_at, account_count, value_count))
+        })?;
+
+    let path_string = state.db_path.to_string_lossy().to_string();
+    Ok(DataHealth {
+        db_path: path_string.clone(),
+        is_icloud: path_string.contains("/Mobile Documents/com~apple~CloudDocs/"),
+        integrity_status,
+        last_fetch_at,
+        last_backup_at,
+        account_count,
+        value_count,
+        pending_conflict_copies: count_conflict_copies(&state.db_path),
+    })
+}
+
+#[tauri::command]
 fn set_backup_frequency(state: State<'_, AppState>, frequency: String) -> Result<(), String> {
     let f = match frequency.as_str() {
         "off" | "daily" | "weekly" | "monthly" => frequency,
@@ -1505,6 +1606,66 @@ fn set_backup_frequency(state: State<'_, AppState>, frequency: String) -> Result
 #[tauri::command]
 fn do_backup_now(state: State<'_, AppState>) -> Result<String, String> {
     run_backup(&state)
+}
+
+#[tauri::command]
+fn restore_backup(state: State<'_, AppState>, backup_path: String) -> Result<String, String> {
+    let source = PathBuf::from(&backup_path);
+    if !source.is_file() || !backup_path.ends_with(".db.gz") {
+        return Err("Select a valid .db.gz backup file".to_string());
+    }
+
+    // Take a recoverable snapshot before touching the live database.
+    let safety_backup = run_backup(&state)?;
+    let _guard = state.local_lock.lock().map_err(|e| e.to_string())?;
+    let parent = state.db_path.parent().ok_or_else(|| "Database path has no parent".to_string())?;
+    let stamp = Utc::now().format("%Y%m%d-%H%M%S-%f").to_string();
+    let restored_temp = parent.join(format!("my_finances-restore-{}.tmp", stamp));
+    let previous_live = parent.join(format!("my_finances-before-restore-{}.db", stamp));
+
+    let unpack_result = (|| -> Result<(), String> {
+        let input = fs::File::open(&source)
+            .map_err(|e| format!("Failed to open backup: {}", e))?;
+        let mut decoder = GzDecoder::new(input);
+        let mut output = fs::File::create(&restored_temp)
+            .map_err(|e| format!("Failed to prepare restored database: {}", e))?;
+        std::io::copy(&mut decoder, &mut output)
+            .map_err(|e| format!("Backup is not a valid gzip archive: {}", e))?;
+        output.sync_all().map_err(|e| format!("Failed to save restored database: {}", e))?;
+        validate_restored_db(&restored_temp)
+    })();
+    if let Err(error) = unpack_result {
+        let _ = fs::remove_file(&restored_temp);
+        return Err(error);
+    }
+
+    fs::rename(&state.db_path, &previous_live)
+        .map_err(|e| format!("Failed to preserve current database: {}", e))?;
+    if let Err(error) = fs::rename(&restored_temp, &state.db_path) {
+        let _ = fs::rename(&previous_live, &state.db_path);
+        let _ = fs::remove_file(&restored_temp);
+        return Err(format!("Failed to install restored database: {}", error));
+    }
+
+    let finalize_result = (|| -> Result<(), String> {
+        let conn = Connection::open(&state.db_path)
+            .map_err(|e| format!("Failed to open restored database: {}", e))?;
+        conn.execute_batch("PRAGMA journal_mode=DELETE;")
+            .map_err(|e| format!("Failed to configure restored database: {}", e))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_backup_at', ?1)",
+            rusqlite::params![Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if let Err(error) = finalize_result {
+        let _ = fs::remove_file(&state.db_path);
+        let _ = fs::rename(&previous_live, &state.db_path);
+        return Err(format!("Restore was rolled back: {}", error));
+    }
+    let _ = fs::remove_file(&previous_live);
+    Ok(safety_backup)
 }
 
 /// On-launch check: if a frequency is set and enough time has elapsed since
@@ -1763,6 +1924,26 @@ mod tests {
             .unwrap();
         assert_eq!(total, 200.0);
     }
+
+    #[test]
+    fn restore_validation_accepts_app_database_and_rejects_wrong_schema() {
+        let valid_path = std::env::temp_dir().join(format!("my-finances-valid-{}.db", uuid::Uuid::new_v4()));
+        {
+            let conn = Connection::open(&valid_path).unwrap();
+            init_db(&conn);
+        }
+        assert!(validate_restored_db(&valid_path).is_ok());
+
+        let invalid_path = std::env::temp_dir().join(format!("my-finances-invalid-{}.db", uuid::Uuid::new_v4()));
+        {
+            let conn = Connection::open(&invalid_path).unwrap();
+            conn.execute("CREATE TABLE unrelated (id INTEGER)", []).unwrap();
+        }
+        assert!(validate_restored_db(&invalid_path).is_err());
+
+        let _ = fs::remove_file(valid_path);
+        let _ = fs::remove_file(invalid_path);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1803,6 +1984,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup({
             let db_path = db_path.clone();
             move |app| {
@@ -1845,8 +2027,10 @@ pub fn run() {
             get_autofetch_setting,
             set_autofetch_setting,
             get_backup_settings,
+            get_data_health,
             set_backup_frequency,
             do_backup_now,
+            restore_backup,
             maybe_backup_on_launch,
             open_backups_folder,
         ])

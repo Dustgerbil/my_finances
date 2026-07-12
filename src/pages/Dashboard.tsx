@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { AccountSummary, AccountChange } from "../types";
+import { formatAccountType } from "../format";
 
 export default function Dashboard() {
   const navigate = useNavigate();
@@ -160,10 +161,12 @@ export default function Dashboard() {
       isNegative ? " negative" : "",
     ].join("");
     return (
-      <div
+      <button
+        type="button"
         key={item.account.id}
         className={`card account-card${cls}`}
         onClick={() => navigate(`/account/${encodeURIComponent(item.account.id)}`)}
+        aria-label={`View ${item.account.name} account details`}
       >
         <div className="account-name">
           {item.account.name}
@@ -174,7 +177,7 @@ export default function Dashboard() {
         </div>
         <div className="account-institution">
           {item.account.institution}
-          {item.account.type ? ` · ${item.account.type}` : ""}
+          {item.account.type ? ` · ${formatAccountType(item.account.type)}` : ""}
         </div>
         <div className="account-balance">
           {formatCurrency(item.latest_balance)}
@@ -203,7 +206,7 @@ export default function Dashboard() {
             })}
           </div>
         )}
-      </div>
+      </button>
     );
   };
 
@@ -221,12 +224,6 @@ export default function Dashboard() {
               {fetching ? "Fetching..." : "Fetch from Akahu"}
             </button>
           )}
-          <button
-            className="btn btn-secondary"
-            onClick={() => navigate("/config")}
-          >
-            Accounts Config
-          </button>
           <button
             className="btn btn-secondary"
             onClick={() => navigate("/settings")}
