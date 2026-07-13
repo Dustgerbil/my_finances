@@ -665,6 +665,7 @@ async fn fetch_akahu_balances(state: State<'_, AppState>) -> Result<String, Stri
 
     // Fetch accounts
     let accounts = fetch_akahu_accounts(&app_id, &user_token).await?;
+    let fetched_at = Utc::now().to_rfc3339();
 
     // Filter NZD only
     let nzd_accounts: Vec<&AkahuAccount> = accounts
@@ -736,6 +737,13 @@ async fn fetch_akahu_balances(state: State<'_, AppState>) -> Result<String, Stri
         tx.execute(
             "INSERT INTO fetch_log (fetched_at) VALUES (?1)",
             rusqlite::params![today],
+        )
+        .map_err(|e| e.to_string())?;
+        // Keep the precise completion time separately: fetch_log deliberately
+        // remains date-only because it enforces the once-per-day behavior.
+        tx.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_fetch_at', ?1)",
+            rusqlite::params![fetched_at],
         )
         .map_err(|e| e.to_string())?;
 
@@ -1550,9 +1558,7 @@ fn get_data_health(state: State<'_, AppState>) -> Result<DataHealth, String> {
             let integrity_status: String = db
                 .query_row("PRAGMA integrity_check", [], |row| row.get(0))
                 .map_err(|e| e.to_string())?;
-            let last_fetch_at = db
-                .query_row("SELECT MAX(fetched_at) FROM fetch_log", [], |row| row.get(0))
-                .map_err(|e| e.to_string())?;
+            let last_fetch_at = get_last_fetch_at(db).map_err(|e| e.to_string())?;
             let last_backup_at = db
                 .query_row(
                     "SELECT value FROM settings WHERE key = 'last_backup_at'",
@@ -1585,6 +1591,30 @@ fn get_data_health(state: State<'_, AppState>) -> Result<DataHealth, String> {
         value_count,
         pending_conflict_copies: count_conflict_copies(&state.db_path),
     })
+}
+
+/// Return the precise fetch timestamp when available. Databases created before
+/// `last_fetch_at` was introduced fall back to the latest date-only fetch log.
+fn get_last_fetch_at(conn: &Connection) -> Result<Option<String>, rusqlite::Error> {
+    let latest_date: Option<String> =
+        conn.query_row("SELECT MAX(fetched_at) FROM fetch_log", [], |row| row.get(0))?;
+    let precise: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'last_fetch_at'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if let Some(value) = precise {
+        let precise_local_date = chrono::DateTime::parse_from_rfc3339(&value)
+            .ok()
+            .map(|date| date.with_timezone(&Local).format("%Y-%m-%d").to_string());
+        if latest_date.is_none() || precise_local_date == latest_date {
+            return Ok(Some(value));
+        }
+    }
+    Ok(latest_date)
 }
 
 #[tauri::command]
@@ -1923,6 +1953,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(total, 200.0);
+    }
+
+    #[test]
+    fn last_fetch_time_prefers_precise_setting_and_falls_back_to_fetch_date() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO fetch_log (fetched_at) VALUES ('2026-07-12')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(get_last_fetch_at(&conn).unwrap().as_deref(), Some("2026-07-12"));
+
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('last_fetch_at', '2026-07-12T08:42:15+00:00')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            get_last_fetch_at(&conn).unwrap().as_deref(),
+            Some("2026-07-12T08:42:15+00:00")
+        );
+
+        conn.execute(
+            "INSERT INTO fetch_log (fetched_at) VALUES ('2026-07-13')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(get_last_fetch_at(&conn).unwrap().as_deref(), Some("2026-07-13"));
     }
 
     #[test]

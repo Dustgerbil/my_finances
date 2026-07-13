@@ -143,10 +143,12 @@ export default function Settings() {
     });
   };
 
-  const formatHealthDate = (value: string | null, dateOnly = false) => {
+  const formatHealthDate = (value: string | null) => {
     if (!value) return "Never";
-    const date = new Date(dateOnly ? `${value}T00:00:00` : value);
-    return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+    const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(value);
+    const date = new Date(isDateOnly ? `${value}T00:00:00` : value);
+    if (Number.isNaN(date.getTime())) return value;
+    return isDateOnly ? date.toLocaleDateString() : date.toLocaleString();
   };
 
   const handleSave = async () => {
@@ -353,7 +355,7 @@ export default function Settings() {
             </div>
             <div className="health-item">
               <span>Last successful fetch</span>
-              <strong>{formatHealthDate(health.last_fetch_at, true)}</strong>
+              <strong>{formatHealthDate(health.last_fetch_at)}</strong>
             </div>
             <div className="health-item">
               <span>Last backup</span>
