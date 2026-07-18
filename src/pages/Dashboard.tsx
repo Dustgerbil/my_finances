@@ -16,7 +16,6 @@ export default function Dashboard() {
     message: string;
   } | null>(null);
   const [hasCredentials, setHasCredentials] = useState<boolean | null>(null);
-  const [autofetch, setAutofetch] = useState(false);
   const didAutofetch = useRef(false);
 
   const checkCredentials = useCallback(async () => {
@@ -60,7 +59,6 @@ export default function Dashboard() {
   useEffect(() => {
     const init = async () => {
       const enabled = await invoke<boolean>("get_autofetch_setting").catch(() => false);
-      setAutofetch(enabled);
 
       // Kick off a backup if a frequency is set and one is due (fire-and-forget;
       // mirrors the autofetch pattern). Runs in parallel with the fetch below.
@@ -71,7 +69,9 @@ export default function Dashboard() {
         const credsOk = await invoke<boolean>("has_akahu_credentials").catch(() => false);
         if (credsOk) {
           try {
-            const result = await invoke<string>("fetch_akahu_balances");
+            const result = await invoke<string>("fetch_akahu_balances", {
+              force: false,
+            });
             // Don't show "Already fetched today" during auto-fetch
             if (result !== "Already fetched today") {
               setStatus({ type: "success", message: result });
@@ -110,9 +110,11 @@ export default function Dashboard() {
 
   const handleFetch = async () => {
     setFetching(true);
-    setStatus({ type: "loading", message: "Fetching from Akahu..." });
+    setStatus({ type: "loading", message: "Refreshing from Akahu..." });
     try {
-      const result = await invoke<string>("fetch_akahu_balances");
+      const result = await invoke<string>("fetch_akahu_balances", {
+        force: true,
+      });
       setStatus({ type: "success", message: result });
       await loadAccounts();
     } catch (err) {
@@ -215,15 +217,13 @@ export default function Dashboard() {
       <div className="header">
         <h1>My Finances</h1>
         <div className="header-actions">
-          {!autofetch && (
-            <button
-              className="btn btn-primary"
-              onClick={handleFetch}
-              disabled={fetching}
-            >
-              {fetching ? "Fetching..." : "Fetch from Akahu"}
-            </button>
-          )}
+          <button
+            className="btn btn-primary"
+            onClick={handleFetch}
+            disabled={fetching}
+          >
+            {fetching ? "Refreshing..." : "Refresh now"}
+          </button>
           <button
             className="btn btn-secondary"
             onClick={() => navigate("/settings")}
@@ -254,7 +254,7 @@ export default function Dashboard() {
       ) : accounts.length === 0 ? (
         <div className="empty-state">
           <p>No accounts yet.</p>
-          <p>Click "Fetch from Akahu" to get started, or add a manual account in config.</p>
+          <p>Click "Refresh now" to get started, or add a manual account in config.</p>
         </div>
       ) : (
         <>

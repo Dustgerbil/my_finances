@@ -634,12 +634,14 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-async fn fetch_akahu_balances(state: State<'_, AppState>) -> Result<String, String> {
+async fn fetch_akahu_balances(state: State<'_, AppState>, force: bool) -> Result<String, String> {
     let (app_id, user_token) = get_akahu_headers()?;
 
-    // Check if we already fetched today (short read; lock released before the network await).
+    // Automatic fetches remain once per day. A user-requested forced refresh
+    // bypasses this guard, then replaces today's values via the daily upserts
+    // below so account history still contains at most one row per day.
     let today = Local::now().format("%Y-%m-%d").to_string();
-    {
+    if !force {
         let already_fetched = with_db_ro(&state, |db| {
             let already: bool = db
                 .query_row(
