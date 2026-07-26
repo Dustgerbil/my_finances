@@ -14,6 +14,16 @@ sub-totals for assets and liabilities, and a line chart of each account's
 history. Your data never leaves your machine (except the one fetch from Akahu)
 and never touches a third-party server.
 
+## Screenshots
+
+### Main screen
+
+![My Finances dashboard showing anonymised account balances](main%20screen.png)
+
+### Total history
+
+![My Finances total balance history with anonymised values](totals.png)
+
 ## Features
 
 - **One-click balance refresh** — fetches live balances from all your Akahu
