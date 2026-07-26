@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import type { Account } from "../types";
 import { formatAccountType } from "../format";

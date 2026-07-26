@@ -1,5 +1,5 @@
 import { lazy, Suspense } from "react";
-import { Routes, Route } from "react-router-dom";
+import { Routes, Route } from "react-router";
 
 const Dashboard = lazy(() => import("./pages/Dashboard"));
 const AccountDetail = lazy(() => import("./pages/AccountDetail"));

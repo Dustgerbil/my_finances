@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:macos": "bash scripts/build-macos-signed.sh",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -13,9 +14,9 @@
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-opener": "^2",
-    "react": "^19.1.0",
-    "react-dom": "^19.1.0",
-    "react-router-dom": "^7.15.1",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-router": "^8.3.0",
     "recharts": "^3.8.1"
   },
   "devDependencies": {
@@ -25,5 +26,8 @@
     "@vitejs/plugin-react": "^6.0.2",
     "typescript": "~5.8.3",
     "vite": "^8.0.16"
+  },
+  "allowScripts": {
+    "fsevents@2.3.3": true
   }
 }
