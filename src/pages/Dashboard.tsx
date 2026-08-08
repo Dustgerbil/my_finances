@@ -75,6 +75,7 @@ export default function Dashboard() {
             // Don't show "Already fetched today" during auto-fetch
             if (result !== "Already fetched today") {
               setStatus({ type: "success", message: result });
+              await loadAccounts();
             }
           } catch (err) {
             setStatus({ type: "error", message: `Auto-fetch failed: ${err}` });
@@ -84,7 +85,7 @@ export default function Dashboard() {
     };
     init();
     checkCredentials();
-  }, [checkCredentials]);
+  }, [checkCredentials, loadAccounts]);
 
   useEffect(() => {
     loadAccounts();
@@ -194,13 +195,20 @@ export default function Dashboard() {
             {changes[item.account.id].map((ch) => {
               if (ch.change_amount == null) return null;
               const symbol =
-                ch.period === "30d" ? "30d" : ch.period === "180d" ? "180d" : "360d";
+                ch.period === "30d"
+                  ? "30d"
+                  : ch.period === "180d"
+                  ? "180d"
+                  : ch.period === "360d"
+                  ? "360d"
+                  : "All";
+              const titleLabel = ch.period === "all" ? "All time" : symbol;
               const sign = ch.change_amount > 0 ? "+" : "";
               return (
                 <span
                   key={ch.period}
                   className={`change-chip ${ch.change_amount > 0 ? "up" : ch.change_amount < 0 ? "down" : ""}`}
-                  title={`${symbol}: ${sign}${formatCurrency(ch.change_amount)}`}
+                  title={`${titleLabel}: ${sign}${formatCurrency(ch.change_amount)}`}
                 >
                   {symbol} {sign}{formatCurrency(ch.change_amount)}
                 </span>

@@ -166,7 +166,7 @@ graphs zig-zag vertically and look "stale". (See history fix, 2026-06-18.)
 | `fetch_akahu_balances` | Trigger Akahu refresh, fetch accounts, store NZD-only, recompute totals. `force=false` is once/day; `force=true` replaces today's snapshot. |
 | `get_accounts_summary` | Cards data, incl. virtual accounts (`id LIKE '__'`). |
 | `get_account_history` | Per-account values for the line chart. |
-| `get_account_changes` | 30d/180d/360d change chips (lookback by recorded_date). |
+| `get_account_changes` | 30d/180d/360d/all-time change chips (lookback by recorded_date). |
 | `get_all_accounts_config` | All real accounts (excl. virtual) for config screen. |
 | `toggle_ignore_account` | Flip `is_ignored`; recomputes totals. Virtual accounts rejected. |
 | `add_manual_account` | Insert manual account row. |
@@ -189,12 +189,18 @@ graphs zig-zag vertically and look "stale". (See history fix, 2026-06-18.)
 - **Autofetch:** when enabled, Dashboard auto-fetches once on first load if
   credentials exist (guarded by a `useRef` so it doesn't loop). This uses
   `force=false`; the always-visible manual "Refresh now" action uses
-  `force=true` to replace today's snapshot with current Akahu data.
+  `force=true` to replace today's snapshot with current Akahu data. After the
+  Akahu refresh job completes, the backend polls `/v1/accounts` until each
+  refreshable NZD account's `refreshed.balance` timestamp is no more than 65
+  minutes old. If freshness cannot be verified within 30 seconds, it writes no
+  account values or daily fetch marker, so the request can be retried.
 - **Max-balance ⭐ badge:** shown on a card when `latest_balance == max_balance`.
 - **Ignore:** ignored accounts are hidden from the dashboard *and* excluded from
   virtual total sums.
-- **Changes lookback:** `get_account_changes` returns `None` when the account's
-  earliest recorded_date is after the lookback date (not enough history yet).
+- **Changes lookback:** `get_account_changes` returns `None` for a fixed period
+  when the account's earliest recorded_date is after the lookback date (not
+  enough history yet). The all-time change compares the latest balance with the
+  earliest recorded balance.
 - **Frontend↔backend types must stay in sync:** `src/types.ts` mirrors the Rust
   structs in `lib.rs`. When changing a struct, update both.
 - All Tauri commands are invoked from the frontend via `@tauri-apps/api/core`'s

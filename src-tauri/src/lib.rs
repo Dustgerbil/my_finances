@@ -1,17 +1,16 @@
-use chrono::Local;
-use chrono::Utc;
-use tauri_plugin_opener::OpenerExt;
-use rusqlite::Connection;
-use notify::Watcher;
-use flate2::write::GzEncoder;
+use chrono::{DateTime, Duration, Local, Utc};
 use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use flate2::Compression;
+use notify::Watcher;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_opener::OpenerExt;
 
 // ---------------------------------------------------------------------------
 // State
@@ -303,7 +302,10 @@ fn merge_conflict_copies(conn: &Connection, live_path: &std::path::Path) {
 /// store today's total under that past date and corrupt the graph. Today's total
 /// is recomputed fresh by the normal fetch/toggle/manual write paths that call
 /// this merge via `open_db_rw`.
-fn merge_one_conflict(conn: &Connection, conflict_path: &std::path::Path) -> Result<(), rusqlite::Error> {
+fn merge_one_conflict(
+    conn: &Connection,
+    conflict_path: &std::path::Path,
+) -> Result<(), rusqlite::Error> {
     let path_str = conflict_path.to_str().unwrap_or("");
     // Safety: if a previous iteration failed after ATTACH but before DETACH,
     // `other` would still be attached and our ATTACH below would error. Detach
@@ -342,7 +344,10 @@ fn merge_one_conflict(conn: &Connection, conflict_path: &std::path::Path) -> Res
     )?;
 
     // settings: union by key, keep live on collision.
-    conn.execute("INSERT OR IGNORE INTO settings SELECT key, value FROM other.settings", [])?;
+    conn.execute(
+        "INSERT OR IGNORE INTO settings SELECT key, value FROM other.settings",
+        [],
+    )?;
 
     conn.execute("DETACH DATABASE other", [])?;
     Ok(())
@@ -367,7 +372,8 @@ fn open_db_rw(path: &std::path::Path) -> Result<Connection, String> {
 /// stale if a conflict just appeared and no write/startup has merged yet —
 /// acceptable, the next write or launch reconciles.
 fn open_db_ro(path: &std::path::Path) -> Result<Connection, String> {
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
     Connection::open_with_flags(path, flags)
         .map_err(|e| format!("Failed to open database read-only: {}", e))
 }
@@ -446,19 +452,23 @@ const KEYRING_SERVICE: &str = "my-finances-akahu";
 
 fn get_akahu_headers() -> Result<(String, String), String> {
     // Try macOS keychain first
-    let kr = keyring_core::Entry::new(KEYRING_SERVICE, "akahu_app_id").map_err(|e| e.to_string())?;
+    let kr =
+        keyring_core::Entry::new(KEYRING_SERVICE, "akahu_app_id").map_err(|e| e.to_string())?;
     let app_id = kr.get_password().ok();
-    let kr = keyring_core::Entry::new(KEYRING_SERVICE, "akahu_user_token").map_err(|e| e.to_string())?;
+    let kr =
+        keyring_core::Entry::new(KEYRING_SERVICE, "akahu_user_token").map_err(|e| e.to_string())?;
     let user_token = kr.get_password().ok();
 
     match (app_id, user_token) {
         (Some(id), Some(token)) => Ok((id, token)),
         _ => {
             // Fall back to env vars
-            let id = std::env::var("AKAHU_APP_ID")
-                .map_err(|_| "Akahu credentials not found. Go to Settings to add them.".to_string())?;
-            let token = std::env::var("AKAHU_USER_TOKEN")
-                .map_err(|_| "Akahu credentials not found. Go to Settings to add them.".to_string())?;
+            let id = std::env::var("AKAHU_APP_ID").map_err(|_| {
+                "Akahu credentials not found. Go to Settings to add them.".to_string()
+            })?;
+            let token = std::env::var("AKAHU_USER_TOKEN").map_err(|_| {
+                "Akahu credentials not found. Go to Settings to add them.".to_string()
+            })?;
             Ok((id, token))
         }
     }
@@ -479,8 +489,10 @@ struct AkahuAccount {
     name: String,
     #[serde(rename = "type")]
     account_type: Option<String>,
+    status: Option<String>,
     connection: Option<AkahuConnection>,
     balance: Option<AkahuBalance>,
+    refreshed: Option<AkahuRefreshed>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -501,16 +513,18 @@ struct AkahuBalance {
 }
 
 #[derive(Debug, Deserialize)]
+struct AkahuRefreshed {
+    balance: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct AkahuRefreshItem {
     #[serde(rename = "_id")]
     id: String,
     status: Option<String>,
 }
 
-async fn trigger_akahu_refresh(
-    app_id: &str,
-    user_token: &str,
-) -> Result<Option<String>, String> {
+async fn trigger_akahu_refresh(app_id: &str, user_token: &str) -> Result<Option<String>, String> {
     let client = reqwest::Client::new();
     let resp = client
         .post("https://api.akahu.io/v1/refresh")
@@ -523,21 +537,34 @@ async fn trigger_akahu_refresh(
 
     // Check HTTP status first
     let status = resp.status();
-    let body_text = resp.text().await.map_err(|e| format!("Failed to read refresh response: {}", e))?;
+    let body_text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read refresh response: {}", e))?;
 
     if !status.is_success() {
-        return Err(format!("Akahu refresh returned HTTP {}: {}", status.as_u16(), truncate_str(&body_text, 200)));
+        return Err(format!(
+            "Akahu refresh returned HTTP {}: {}",
+            status.as_u16(),
+            truncate_str(&body_text, 200)
+        ));
     }
 
     let data: AkahuApiResponse<AkahuRefreshItem> =
-        serde_json::from_str(&body_text)
-            .map_err(|e| format!("Failed to parse refresh response: {}. Body: {}", e, truncate_str(&body_text, 200)))?;
+        serde_json::from_str(&body_text).map_err(|e| {
+            format!(
+                "Failed to parse refresh response: {}. Body: {}",
+                e,
+                truncate_str(&body_text, 200)
+            )
+        })?;
 
     if !data.success {
         return Err(data.message.unwrap_or_else(|| "Unknown error".to_string()));
     }
 
-    // If there's no item, there's nothing to refresh — that's fine
+    // A request may return no job when Akahu decides there is nothing to do.
+    // The caller still validates the account balance timestamps before saving.
     Ok(data.item.map(|r| r.id))
 }
 
@@ -567,15 +594,27 @@ async fn wait_for_refresh(
             .map_err(|e| format!("HTTP error checking refresh: {}", e))?;
 
         let status = resp.status();
-        let body_text = resp.text().await.map_err(|e| format!("Failed to read refresh status: {}", e))?;
+        let body_text = resp
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read refresh status: {}", e))?;
 
         if !status.is_success() {
-            return Err(format!("Refresh status HTTP {}: {}", status.as_u16(), truncate_str(&body_text, 200)));
+            return Err(format!(
+                "Refresh status HTTP {}: {}",
+                status.as_u16(),
+                truncate_str(&body_text, 200)
+            ));
         }
 
         let data: AkahuApiResponse<AkahuRefreshItem> =
-            serde_json::from_str(&body_text)
-                .map_err(|e| format!("Failed to parse refresh status: {}. Body: {}", e, truncate_str(&body_text, 200)))?;
+            serde_json::from_str(&body_text).map_err(|e| {
+                format!(
+                    "Failed to parse refresh status: {}. Body: {}",
+                    e,
+                    truncate_str(&body_text, 200)
+                )
+            })?;
 
         if !data.success {
             return Err(data.message.unwrap_or_else(|| "Unknown error".to_string()));
@@ -583,16 +622,15 @@ async fn wait_for_refresh(
 
         match data.item.and_then(|r| r.status) {
             Some(ref status) if status == "COMPLETED" => return Ok(true),
-            Some(ref status) if status == "ERROR" => return Err("Refresh failed with error".to_string()),
+            Some(ref status) if status == "ERROR" => {
+                return Err("Refresh failed with error".to_string())
+            }
             _ => {} // still in progress, loop
         }
     }
 }
 
-async fn fetch_akahu_accounts(
-    app_id: &str,
-    user_token: &str,
-) -> Result<Vec<AkahuAccount>, String> {
+async fn fetch_akahu_accounts(app_id: &str, user_token: &str) -> Result<Vec<AkahuAccount>, String> {
     let client = reqwest::Client::new();
     let resp = client
         .get("https://api.akahu.io/v1/accounts")
@@ -604,21 +642,111 @@ async fn fetch_akahu_accounts(
         .map_err(|e| format!("HTTP error fetching accounts: {}", e))?;
 
     let status = resp.status();
-    let body_text = resp.text().await.map_err(|e| format!("Failed to read accounts response: {}", e))?;
+    let body_text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read accounts response: {}", e))?;
 
     if !status.is_success() {
-        return Err(format!("Akahu accounts returned HTTP {}: {}", status.as_u16(), truncate_str(&body_text, 200)));
+        return Err(format!(
+            "Akahu accounts returned HTTP {}: {}",
+            status.as_u16(),
+            truncate_str(&body_text, 200)
+        ));
     }
 
-    let data: AkahuApiResponse<AkahuAccount> =
-        serde_json::from_str(&body_text)
-            .map_err(|e| format!("Failed to parse accounts response: {}. Body: {}", e, truncate_str(&body_text, 200)))?;
+    let data: AkahuApiResponse<AkahuAccount> = serde_json::from_str(&body_text).map_err(|e| {
+        format!(
+            "Failed to parse accounts response: {}. Body: {}",
+            e,
+            truncate_str(&body_text, 200)
+        )
+    })?;
 
     if !data.success {
         return Err(data.message.unwrap_or_else(|| "Unknown error".to_string()));
     }
 
     Ok(data.items.unwrap_or_default())
+}
+
+const MAX_ACCEPTABLE_BALANCE_AGE_MINUTES: i64 = 65;
+const ACCOUNT_FRESHNESS_TIMEOUT_SECS: u64 = 30;
+const ACCOUNT_FRESHNESS_POLL_SECS: u64 = 3;
+
+fn is_nzd_account(account: &AkahuAccount) -> bool {
+    account
+        .balance
+        .as_ref()
+        .and_then(|balance| balance.currency.as_deref())
+        .unwrap_or("NZD")
+        == "NZD"
+}
+
+fn is_refreshable_account(account: &AkahuAccount) -> bool {
+    account.status.as_deref() != Some("INACTIVE")
+}
+
+fn balance_freshness_issues(
+    accounts: &[AkahuAccount],
+    now: DateTime<Utc>,
+    maximum_age: Duration,
+) -> Vec<String> {
+    accounts
+        .iter()
+        .filter(|account| is_nzd_account(account) && is_refreshable_account(account))
+        .filter_map(|account| {
+            let timestamp = match account
+                .refreshed
+                .as_ref()
+                .and_then(|refreshed| refreshed.balance.as_deref())
+            {
+                Some(timestamp) => timestamp,
+                None => {
+                    return Some(format!("{} (no balance refresh time)", account.name));
+                }
+            };
+
+            let refreshed_at = match DateTime::parse_from_rfc3339(timestamp) {
+                Ok(timestamp) => timestamp.with_timezone(&Utc),
+                Err(_) => {
+                    return Some(format!("{} (invalid balance refresh time)", account.name));
+                }
+            };
+
+            if now.signed_duration_since(refreshed_at) > maximum_age {
+                Some(format!("{} (last refreshed {})", account.name, timestamp))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+async fn fetch_fresh_akahu_accounts(
+    app_id: &str,
+    user_token: &str,
+    timeout_secs: u64,
+) -> Result<Vec<AkahuAccount>, String> {
+    let started = std::time::Instant::now();
+    let maximum_age = Duration::minutes(MAX_ACCEPTABLE_BALANCE_AGE_MINUTES);
+
+    loop {
+        let accounts = fetch_akahu_accounts(app_id, user_token).await?;
+        let issues = balance_freshness_issues(&accounts, Utc::now(), maximum_age);
+        if issues.is_empty() {
+            return Ok(accounts);
+        }
+
+        if started.elapsed().as_secs() >= timeout_secs {
+            return Err(format!(
+                "Akahu refresh completed, but current balances were not ready for: {}. No data was saved; try Refresh now again.",
+                issues.join(", ")
+            ));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(ACCOUNT_FRESHNESS_POLL_SECS)).await;
+    }
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {
@@ -657,7 +785,8 @@ async fn fetch_akahu_balances(state: State<'_, AppState>, force: bool) -> Result
         }
     }
 
-    // Trigger refresh (skip if nothing to refresh)
+    // Trigger and wait when Akahu creates a refresh job. Source balance
+    // timestamps are validated below whether or not a job is returned.
     if let Some(refresh_id) = trigger_akahu_refresh(&app_id, &user_token).await? {
         let completed = wait_for_refresh(&app_id, &user_token, &refresh_id, 120).await?;
         if !completed {
@@ -665,20 +794,23 @@ async fn fetch_akahu_balances(state: State<'_, AppState>, force: bool) -> Result
         }
     }
 
-    // Fetch accounts
-    let accounts = fetch_akahu_accounts(&app_id, &user_token).await?;
+    // Akahu serves account reads from its cache, and a completed refresh job can
+    // become visible there asynchronously. Poll until every refreshable NZD
+    // account has a recent source balance timestamp. A Personal App's manual
+    // refresh rest period is one hour; the extra five minutes avoids rejecting
+    // a just-within-window result due to clock or request latency. If freshness
+    // cannot be verified, return before writing values or today's fetch marker
+    // so the user can retry.
+    let accounts =
+        fetch_fresh_akahu_accounts(&app_id, &user_token, ACCOUNT_FRESHNESS_TIMEOUT_SECS).await?;
     let fetched_at = Utc::now().to_rfc3339();
 
-    // Filter NZD only
+    // Filter to refreshable NZD accounts. Inactive accounts remain in history
+    // at their last known value instead of receiving a misleading new daily
+    // snapshot that Akahu can no longer refresh.
     let nzd_accounts: Vec<&AkahuAccount> = accounts
         .iter()
-        .filter(|a| {
-            a.balance
-                .as_ref()
-                .and_then(|b| b.currency.as_deref())
-                .unwrap_or("NZD")
-                == "NZD"
-        })
+        .filter(|account| is_nzd_account(account) && is_refreshable_account(account))
         .collect();
 
     // Save to database (tight write critical section; no lock held during the network above).
@@ -690,19 +822,11 @@ async fn fetch_akahu_balances(state: State<'_, AppState>, force: bool) -> Result
                 .as_ref()
                 .and_then(|c| c.institution.as_ref())
                 .and_then(|i| i.name.as_deref())
-                .or_else(|| {
-                    acc.connection
-                        .as_ref()
-                        .and_then(|c| c.name.as_deref())
-                })
+                .or_else(|| acc.connection.as_ref().and_then(|c| c.name.as_deref()))
                 .unwrap_or("Unknown");
 
             let acc_type = acc.account_type.as_deref().unwrap_or("Unknown");
-            let balance = acc
-                .balance
-                .as_ref()
-                .and_then(|b| b.current)
-                .unwrap_or(0.0);
+            let balance = acc.balance.as_ref().and_then(|b| b.current).unwrap_or(0.0);
 
             // Upsert account
             tx.execute(
@@ -720,8 +844,7 @@ async fn fetch_akahu_balances(state: State<'_, AppState>, force: bool) -> Result
             // Upsert today's account value (idempotent per (account, day)) so a
             // same-day re-fetch on another machine overwrites rather than
             // duplicating — keeps the merge lossless even without a lock.
-            upsert_daily_account_value(&tx, &acc.id, balance, &today)
-                .map_err(|e| e.to_string())?;
+            upsert_daily_account_value(&tx, &acc.id, balance, &today).map_err(|e| e.to_string())?;
         }
 
         // ---- Virtual total account ----
@@ -860,8 +983,14 @@ fn get_account_history(
             .map_err(|e| e.to_string())?;
 
         let current_balance = values.last().map(|v| v.balance);
-        let min_balance = values.iter().map(|v| v.balance).fold(f64::INFINITY, f64::min);
-        let max_balance = values.iter().map(|v| v.balance).fold(f64::NEG_INFINITY, f64::max);
+        let min_balance = values
+            .iter()
+            .map(|v| v.balance)
+            .fold(f64::INFINITY, f64::min);
+        let max_balance = values
+            .iter()
+            .map(|v| v.balance)
+            .fold(f64::NEG_INFINITY, f64::max);
 
         // Date the min/max value last occurred. `values` is ordered ASC by
         // date, so iterating and keeping the last match gives the most recent
@@ -1119,26 +1248,23 @@ fn get_account_changes(
             )
             .ok();
 
-        // Find the earliest recorded date for this account
-        let earliest_date: Option<String> = db
+        // Find the earliest measurement for this account. The date gates the
+        // fixed lookbacks, while the balance is the baseline for "all time".
+        let earliest_measurement: Option<(f64, String)> = db
             .query_row(
-                "SELECT recorded_date
+                "SELECT balance, recorded_date
                  FROM account_values
                  WHERE account_id = ?1
-                 ORDER BY recorded_date ASC
+                 ORDER BY recorded_date ASC, id ASC
                  LIMIT 1",
                 rusqlite::params![account_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .ok();
 
         let today = Local::now().format("%Y-%m-%d").to_string();
 
-        let periods: Vec<(&str, i64)> = vec![
-            ("30d", 30),
-            ("180d", 180),
-            ("360d", 360),
-        ];
+        let periods: Vec<(&str, i64)> = vec![("30d", 30), ("180d", 180), ("360d", 360)];
 
         let mut results = Vec::new();
 
@@ -1151,9 +1277,9 @@ fn get_account_changes(
             let (prev_balance, prev_date): (Option<f64>, Option<String>) =
                 if let Some(ref lb) = lookback_date {
                     // Check if the earliest measurement is after the lookback date
-                    let before_measurements = earliest_date
+                    let before_measurements = earliest_measurement
                         .as_ref()
-                        .map(|e| e.as_str() > lb.as_str())
+                        .map(|(_, date)| date.as_str() > lb.as_str())
                         .unwrap_or(true);
 
                     if before_measurements {
@@ -1200,6 +1326,26 @@ fn get_account_changes(
             });
         }
 
+        let (all_time_balance, all_time_date) = earliest_measurement
+            .map(|(balance, date)| (Some(balance), Some(date)))
+            .unwrap_or((None, None));
+        let all_time_change = match (current_balance, all_time_balance) {
+            (Some(cur), Some(prev)) if prev != 0.0 => {
+                let amount = cur - prev;
+                (Some(amount), Some((amount / prev.abs()) * 100.0))
+            }
+            (Some(cur), Some(prev)) => (Some(cur - prev), None),
+            _ => (None, None),
+        };
+
+        results.push(AccountChange {
+            period: "all".to_string(),
+            previous_balance: all_time_balance,
+            previous_date: all_time_date,
+            change_amount: all_time_change.0,
+            change_percent: all_time_change.1,
+        });
+
         Ok(results)
     })
 }
@@ -1210,19 +1356,25 @@ fn get_account_changes(
 
 #[tauri::command]
 fn has_akahu_credentials() -> Result<bool, String> {
-    let kr = keyring_core::Entry::new(KEYRING_SERVICE, "akahu_app_id").map_err(|e| e.to_string())?;
+    let kr =
+        keyring_core::Entry::new(KEYRING_SERVICE, "akahu_app_id").map_err(|e| e.to_string())?;
     let has_app_id = kr.get_password().is_ok();
-    let kr = keyring_core::Entry::new(KEYRING_SERVICE, "akahu_user_token").map_err(|e| e.to_string())?;
+    let kr =
+        keyring_core::Entry::new(KEYRING_SERVICE, "akahu_user_token").map_err(|e| e.to_string())?;
     let has_token = kr.get_password().is_ok();
     Ok(has_app_id && has_token)
 }
 
 #[tauri::command]
 fn save_akahu_credentials(app_id: String, user_token: String) -> Result<(), String> {
-    let kr = keyring_core::Entry::new(KEYRING_SERVICE, "akahu_app_id").map_err(|e| e.to_string())?;
-    kr.set_password(&app_id).map_err(|e| format!("Failed to save App ID: {}", e))?;
-    let kr = keyring_core::Entry::new(KEYRING_SERVICE, "akahu_user_token").map_err(|e| e.to_string())?;
-    kr.set_password(&user_token).map_err(|e| format!("Failed to save User Token: {}", e))?;
+    let kr =
+        keyring_core::Entry::new(KEYRING_SERVICE, "akahu_app_id").map_err(|e| e.to_string())?;
+    kr.set_password(&app_id)
+        .map_err(|e| format!("Failed to save App ID: {}", e))?;
+    let kr =
+        keyring_core::Entry::new(KEYRING_SERVICE, "akahu_user_token").map_err(|e| e.to_string())?;
+    kr.set_password(&user_token)
+        .map_err(|e| format!("Failed to save User Token: {}", e))?;
     Ok(())
 }
 
@@ -1275,10 +1427,10 @@ const BACKUP_SUFFIX: &str = ".db.gz";
 /// Settings surfaced to the frontend.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct BackupSettings {
-    frequency: String, // "off" | "daily" | "weekly" | "monthly"
+    frequency: String,              // "off" | "daily" | "weekly" | "monthly"
     last_backup_at: Option<String>, // ISO-8601 UTC, or None if never
-    backup_dir: String, // resolved absolute path actually in use
-    is_default_dir: bool, // true when no custom dir set (backup_dir is the default)
+    backup_dir: String,             // resolved absolute path actually in use
+    is_default_dir: bool,           // true when no custom dir set (backup_dir is the default)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1337,15 +1489,15 @@ fn backup_interval_secs(frequency: &str) -> Option<i64> {
         "daily" => Some(86_400),
         "weekly" => Some(604_800),
         "monthly" => Some(2_592_000), // 30 days
-        _ => None, // "off"
+        _ => None,                    // "off"
     }
 }
 
 /// Snapshot the live DB to `target` via `VACUUM INTO` (clean, compacted copy).
 /// Opens the source read-only; VACUUM INTO does not mutate the source.
 fn snapshot_db(live_path: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
- let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(live_path, flags)
         .map_err(|e| format!("Failed to open DB for snapshot: {}", e))?;
     let target_str = target
@@ -1359,8 +1511,8 @@ fn snapshot_db(live_path: &std::path::Path, target: &std::path::Path) -> Result<
 /// Gzip a source file into `target` (a `.db.gz`), then delete the source.
 fn gzip_file(src: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
     let input = fs::read(src).map_err(|e| format!("Failed to read snapshot: {}", e))?;
-    let out = fs::File::create(target)
-        .map_err(|e| format!("Failed to create backup file: {}", e))?;
+    let out =
+        fs::File::create(target).map_err(|e| format!("Failed to create backup file: {}", e))?;
     let mut enc = GzEncoder::new(out, Compression::default());
     enc.write_all(&input)
         .map_err(|e| format!("Failed to compress backup: {}", e))?;
@@ -1406,8 +1558,12 @@ fn prune_backups(dir: &std::path::Path, frequency: &str) {
 }
 
 fn count_conflict_copies(live_path: &std::path::Path) -> usize {
-    let Some(dir) = live_path.parent() else { return 0 };
-    let Some(live_name) = live_path.file_name().and_then(|name| name.to_str()) else { return 0 };
+    let Some(dir) = live_path.parent() else {
+        return 0;
+    };
+    let Some(live_name) = live_path.file_name().and_then(|name| name.to_str()) else {
+        return 0;
+    };
     let stem = live_name.trim_end_matches(".db");
     fs::read_dir(dir)
         .map(|entries| {
@@ -1424,15 +1580,18 @@ fn count_conflict_copies(live_path: &std::path::Path) -> usize {
 }
 
 fn validate_restored_db(path: &std::path::Path) -> Result<(), String> {
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)
         .map_err(|e| format!("Restored file is not a readable SQLite database: {}", e))?;
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .map_err(|e| format!("Could not validate restored database: {}", e))?;
     if integrity != "ok" {
-        return Err(format!("Restored database failed integrity check: {}", integrity));
+        return Err(format!(
+            "Restored database failed integrity check: {}",
+            integrity
+        ));
     }
     for table in ["accounts", "account_values", "fetch_log", "settings"] {
         let exists: bool = conn
@@ -1443,7 +1602,10 @@ fn validate_restored_db(path: &std::path::Path) -> Result<(), String> {
             )
             .map_err(|e| e.to_string())?;
         if !exists {
-            return Err(format!("Restored database is missing required table '{}'", table));
+            return Err(format!(
+                "Restored database is missing required table '{}'",
+                table
+            ));
         }
     }
     Ok(())
@@ -1458,8 +1620,7 @@ fn validate_restored_db(path: &std::path::Path) -> Result<(), String> {
 /// `last_backup_at` setting so the file copy+gzip don't block reads.
 fn run_backup(state: &AppState) -> Result<String, String> {
     let dir = resolve_backups_dir(state);
-    fs::create_dir_all(&dir)
-        .map_err(|e| format!("Failed to create backups dir: {}", e))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create backups dir: {}", e))?;
 
     let ts = Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let temp_db = dir.join(format!("{}{}.tmp", BACKUP_PREFIX, ts));
@@ -1536,7 +1697,10 @@ fn get_backup_settings(state: State<'_, AppState>) -> Result<BackupSettings, Str
             if pb.is_absolute() {
                 (p, false)
             } else {
-                (resolve_backups_dir(&state).to_string_lossy().to_string(), true)
+                (
+                    resolve_backups_dir(&state).to_string_lossy().to_string(),
+                    true,
+                )
             }
         }
         None => (
@@ -1579,7 +1743,13 @@ fn get_data_health(state: State<'_, AppState>) -> Result<DataHealth, String> {
             let value_count = db
                 .query_row("SELECT COUNT(*) FROM account_values", [], |row| row.get(0))
                 .map_err(|e| e.to_string())?;
-            Ok((integrity_status, last_fetch_at, last_backup_at, account_count, value_count))
+            Ok((
+                integrity_status,
+                last_fetch_at,
+                last_backup_at,
+                account_count,
+                value_count,
+            ))
         })?;
 
     let path_string = state.db_path.to_string_lossy().to_string();
@@ -1599,7 +1769,9 @@ fn get_data_health(state: State<'_, AppState>) -> Result<DataHealth, String> {
 /// `last_fetch_at` was introduced fall back to the latest date-only fetch log.
 fn get_last_fetch_at(conn: &Connection) -> Result<Option<String>, rusqlite::Error> {
     let latest_date: Option<String> =
-        conn.query_row("SELECT MAX(fetched_at) FROM fetch_log", [], |row| row.get(0))?;
+        conn.query_row("SELECT MAX(fetched_at) FROM fetch_log", [], |row| {
+            row.get(0)
+        })?;
     let precise: Option<String> = conn
         .query_row(
             "SELECT value FROM settings WHERE key = 'last_fetch_at'",
@@ -1650,20 +1822,24 @@ fn restore_backup(state: State<'_, AppState>, backup_path: String) -> Result<Str
     // Take a recoverable snapshot before touching the live database.
     let safety_backup = run_backup(&state)?;
     let _guard = state.local_lock.lock().map_err(|e| e.to_string())?;
-    let parent = state.db_path.parent().ok_or_else(|| "Database path has no parent".to_string())?;
+    let parent = state
+        .db_path
+        .parent()
+        .ok_or_else(|| "Database path has no parent".to_string())?;
     let stamp = Utc::now().format("%Y%m%d-%H%M%S-%f").to_string();
     let restored_temp = parent.join(format!("my_finances-restore-{}.tmp", stamp));
     let previous_live = parent.join(format!("my_finances-before-restore-{}.db", stamp));
 
     let unpack_result = (|| -> Result<(), String> {
-        let input = fs::File::open(&source)
-            .map_err(|e| format!("Failed to open backup: {}", e))?;
+        let input = fs::File::open(&source).map_err(|e| format!("Failed to open backup: {}", e))?;
         let mut decoder = GzDecoder::new(input);
         let mut output = fs::File::create(&restored_temp)
             .map_err(|e| format!("Failed to prepare restored database: {}", e))?;
         std::io::copy(&mut decoder, &mut output)
             .map_err(|e| format!("Backup is not a valid gzip archive: {}", e))?;
-        output.sync_all().map_err(|e| format!("Failed to save restored database: {}", e))?;
+        output
+            .sync_all()
+            .map_err(|e| format!("Failed to save restored database: {}", e))?;
         validate_restored_db(&restored_temp)
     })();
     if let Err(error) = unpack_result {
@@ -1751,8 +1927,7 @@ fn maybe_backup_on_launch(state: State<'_, AppState>) -> Result<bool, String> {
 #[tauri::command]
 fn open_backups_folder(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<(), String> {
     let dir = resolve_backups_dir(&state);
-    fs::create_dir_all(&dir)
-        .map_err(|e| format!("Failed to create backups dir: {}", e))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create backups dir: {}", e))?;
     app.opener()
         .open_path(dir.to_string_lossy().to_string(), None::<&str>)
         .map_err(|e| format!("Failed to open folder: {}", e))
@@ -1907,6 +2082,28 @@ fn seed_total_if_missing(conn: &Connection) {
 mod tests {
     use super::*;
 
+    fn akahu_account(
+        name: &str,
+        status: Option<&str>,
+        currency: Option<&str>,
+        balance_refreshed_at: Option<&str>,
+    ) -> AkahuAccount {
+        AkahuAccount {
+            id: format!("account-{}", name.to_lowercase().replace(' ', "-")),
+            name: name.to_string(),
+            account_type: Some("CHECKING".to_string()),
+            status: status.map(str::to_string),
+            connection: None,
+            balance: Some(AkahuBalance {
+                current: Some(100.0),
+                currency: currency.map(str::to_string),
+            }),
+            refreshed: Some(AkahuRefreshed {
+                balance: balance_refreshed_at.map(str::to_string),
+            }),
+        }
+    }
+
     fn test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn);
@@ -1938,6 +2135,65 @@ mod tests {
     }
 
     #[test]
+    fn balance_freshness_accepts_recent_source_timestamp() {
+        let now = DateTime::parse_from_rfc3339("2026-08-08T08:30:00+12:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let accounts = vec![akahu_account(
+            "Current Account",
+            Some("ACTIVE"),
+            Some("NZD"),
+            Some("2026-08-08T07:30:00+12:00"),
+        )];
+
+        assert!(balance_freshness_issues(&accounts, now, Duration::minutes(65)).is_empty());
+    }
+
+    #[test]
+    fn balance_freshness_rejects_stale_or_missing_source_timestamp() {
+        let now = DateTime::parse_from_rfc3339("2026-08-08T08:30:00+12:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let accounts = vec![
+            akahu_account(
+                "Stale Account",
+                Some("ACTIVE"),
+                Some("NZD"),
+                Some("2026-08-07T20:00:00+12:00"),
+            ),
+            akahu_account("Missing Timestamp", Some("ACTIVE"), Some("NZD"), None),
+        ];
+
+        let issues = balance_freshness_issues(&accounts, now, Duration::minutes(65));
+        assert_eq!(issues.len(), 2);
+        assert!(issues[0].starts_with("Stale Account"));
+        assert!(issues[1].starts_with("Missing Timestamp"));
+    }
+
+    #[test]
+    fn balance_freshness_ignores_inactive_and_non_nzd_accounts() {
+        let now = DateTime::parse_from_rfc3339("2026-08-08T08:30:00+12:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let accounts = vec![
+            akahu_account(
+                "Inactive Account",
+                Some("INACTIVE"),
+                Some("NZD"),
+                Some("2025-01-01T00:00:00+12:00"),
+            ),
+            akahu_account(
+                "Foreign Account",
+                Some("ACTIVE"),
+                Some("USD"),
+                Some("2025-01-01T00:00:00+12:00"),
+            ),
+        ];
+
+        assert!(balance_freshness_issues(&accounts, now, Duration::minutes(65)).is_empty());
+    }
+
+    #[test]
     fn totals_use_latest_date_not_highest_insert_id() {
         let conn = test_db();
         // Simulate conflict merging: an older row is inserted after the current
@@ -1965,7 +2221,10 @@ mod tests {
             [],
         )
         .unwrap();
-        assert_eq!(get_last_fetch_at(&conn).unwrap().as_deref(), Some("2026-07-12"));
+        assert_eq!(
+            get_last_fetch_at(&conn).unwrap().as_deref(),
+            Some("2026-07-12")
+        );
 
         conn.execute(
             "INSERT INTO settings (key, value) VALUES ('last_fetch_at', '2026-07-12T08:42:15+00:00')",
@@ -1982,22 +2241,28 @@ mod tests {
             [],
         )
         .unwrap();
-        assert_eq!(get_last_fetch_at(&conn).unwrap().as_deref(), Some("2026-07-13"));
+        assert_eq!(
+            get_last_fetch_at(&conn).unwrap().as_deref(),
+            Some("2026-07-13")
+        );
     }
 
     #[test]
     fn restore_validation_accepts_app_database_and_rejects_wrong_schema() {
-        let valid_path = std::env::temp_dir().join(format!("my-finances-valid-{}.db", uuid::Uuid::new_v4()));
+        let valid_path =
+            std::env::temp_dir().join(format!("my-finances-valid-{}.db", uuid::Uuid::new_v4()));
         {
             let conn = Connection::open(&valid_path).unwrap();
             init_db(&conn);
         }
         assert!(validate_restored_db(&valid_path).is_ok());
 
-        let invalid_path = std::env::temp_dir().join(format!("my-finances-invalid-{}.db", uuid::Uuid::new_v4()));
+        let invalid_path =
+            std::env::temp_dir().join(format!("my-finances-invalid-{}.db", uuid::Uuid::new_v4()));
         {
             let conn = Connection::open(&invalid_path).unwrap();
-            conn.execute("CREATE TABLE unrelated (id INTEGER)", []).unwrap();
+            conn.execute("CREATE TABLE unrelated (id INTEGER)", [])
+                .unwrap();
         }
         assert!(validate_restored_db(&invalid_path).is_err());
 
@@ -2050,12 +2315,13 @@ pub fn run() {
             move |app| {
                 // Rebuild the watcher with a handler that emits a Tauri event.
                 let app_handle = app.handle().clone();
-                let mut watcher =
-                    notify::recommended_watcher(move |_res: Result<notify::Event, notify::Error>| {
+                let mut watcher = notify::recommended_watcher(
+                    move |_res: Result<notify::Event, notify::Error>| {
                         // Debounce in the frontend; just emit on every event.
                         let _ = app_handle.emit("db-changed", ());
-                    })
-                    .expect("Failed to create file watcher");
+                    },
+                )
+                .expect("Failed to create file watcher");
                 watcher
                     .watch(&db_path, notify::RecursiveMode::NonRecursive)
                     .expect("Failed to watch database file");

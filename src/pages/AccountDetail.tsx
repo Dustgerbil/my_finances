@@ -340,7 +340,9 @@ export default function AccountDetail() {
                   ? "30 days"
                   : ch.period === "180d"
                   ? "180 days"
-                  : "360 days";
+                  : ch.period === "360d"
+                  ? "360 days"
+                  : "All time";
               const isUp = ch.change_amount != null && ch.change_amount > 0;
               const isDown = ch.change_amount != null && ch.change_amount < 0;
               const cls = isUp ? "change-up" : isDown ? "change-down" : "";

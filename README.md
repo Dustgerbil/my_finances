@@ -26,8 +26,8 @@ and never touches a third-party server.
 
 ## Features
 
-- **One-click balance refresh** — fetches live balances from all your Akahu
-  accounts and stores them once per day.
+- **One-click balance refresh** — requests live balances from Akahu, verifies
+  their source refresh timestamps, and only then stores the daily snapshot.
 - **Dashboard** — a card per account showing current balance and 30/180/360-day
   change chips, plus virtual "Total", "Assets & Savings", and "Liabilities"
   sub-total cards.
