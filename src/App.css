@@ -150,6 +150,30 @@ body {
   color: var(--accent);
 }
 
+.balance-with-direction {
+  display: flex;
+  align-items: baseline;
+  gap: 0.35em;
+}
+
+.balance-direction {
+  font-size: 0.9em;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.balance-direction.up {
+  color: var(--success);
+}
+
+.balance-direction.down {
+  color: var(--danger);
+}
+
+.balance-direction.flat {
+  color: var(--text-secondary);
+}
+
 .account-card .account-date {
   font-size: 0.75rem;
   color: var(--text-secondary);
@@ -287,6 +311,113 @@ body {
 
 .stat-current {
   color: var(--accent);
+}
+
+.liability-calculations,
+.liability-repayment-form {
+  margin-top: 20px;
+  padding: 16px;
+}
+
+.liability-calculations h3,
+.liability-repayment-form h3 {
+  font-size: 1rem;
+  margin-bottom: 4px;
+}
+
+.liability-calculations .detail-stats {
+  margin-top: 12px;
+}
+
+.repayment-details-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.liability-repayment-form > p,
+.calculation-note {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.calculation-note {
+  margin-top: 12px;
+}
+
+.repayment-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.repayment-readonly-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px 24px;
+  margin-top: 16px;
+}
+
+.repayment-readonly-grid > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.repayment-readonly-grid span {
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.repayment-readonly-grid strong {
+  font-size: 0.95rem;
+}
+
+.repayment-readonly-grid + .inline-status {
+  display: block;
+  margin-top: 12px;
+}
+
+.frequency-inputs {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+}
+
+.form-group select {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: white;
+  font-size: 0.875rem;
+}
+
+.form-group select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.repayment-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.inline-status {
+  font-size: 0.8rem;
+}
+
+.inline-status.success {
+  color: var(--success);
+}
+
+.inline-status.error {
+  color: var(--danger);
 }
 
 .stat-min {
@@ -706,6 +837,11 @@ body {
 }
 
 @media (max-width: 600px) {
+  .repayment-form-grid,
+  .repayment-readonly-grid {
+    grid-template-columns: 1fr;
+  }
+
   .data-health-grid {
     grid-template-columns: 1fr;
   }

@@ -26,11 +26,14 @@ and never touches a third-party server.
 
 ## Features
 
-- **One-click balance refresh** — requests live balances from Akahu, verifies
-  their source refresh timestamps, and only then stores the daily snapshot.
-- **Dashboard** — a card per account showing current balance and 30/180/360-day
-  change chips, plus virtual "Total", "Assets & Savings", and "Liabilities"
-  sub-total cards.
+- **One-click balance refresh** — requests live balances from Akahu and verifies
+  their source refresh timestamps before storing the daily snapshot. If the
+  refresh job times out, it gracefully falls back to the account data Akahu has
+  available instead of failing the whole fetch.
+- **Dashboard** — a card per account showing current balance, direction since
+  the previous saved value, and 30/180/360-day change chips, plus virtual
+  "Total", "Assets & Savings", and "Liabilities" sub-total cards. The same
+  direction indicator appears beside Current Value on each account page.
 - **All-time-high badge (⭐)** — a card earns a star when its latest balance
   equals its all-time maximum.
 - **Per-account history** — click any card for a line chart of the account over

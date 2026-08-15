@@ -6,6 +6,12 @@ export interface Account {
   currency: string;
   is_manual: boolean;
   is_ignored: boolean;
+  interest_rate: number | null;
+  repayment_amount: number | null;
+  repayment_frequency: number | null;
+  repayment_frequency_unit: "days" | "weeks" | "months" | null;
+  rate_expiry: string | null;
+  initial_next_repayment_date: string | null;
 }
 
 export interface AccountValue {
@@ -24,6 +30,7 @@ export interface DeletedValue {
 export interface AccountSummary {
   account: Account;
   latest_balance: number | null;
+  previous_balance: number | null;
   latest_date: string | null;
   max_balance: number | null;
 }
@@ -32,10 +39,14 @@ export interface AccountHistory {
   account: Account;
   values: AccountValue[];
   current_balance: number | null;
+  previous_balance: number | null;
   min_balance: number | null;
   min_balance_date: string | null;
   max_balance: number | null;
   max_balance_date: string | null;
+  next_repayment_date: string | null;
+  estimated_repayment_date: string | null;
+  repayment_estimate_status: string | null;
 }
 
 export interface AccountChange {

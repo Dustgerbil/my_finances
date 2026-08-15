@@ -13,6 +13,7 @@ import {
 } from "recharts";
 import type { AccountHistory, AccountChange, DeletedValue } from "../types";
 import { formatAccountType } from "../format";
+import BalanceDirection from "../components/BalanceDirection";
 
 type ChartRange = "1m" | "6m" | "1y" | "all";
 
@@ -45,6 +46,22 @@ export default function AccountDetail() {
   const [error, setError] = useState<string | null>(null);
   const [changes, setChanges] = useState<AccountChange[]>([]);
   const [chartRange, setChartRange] = useState<ChartRange>("1y");
+
+  // Optional repayment details for accounts whose current balance is negative.
+  const [interestRate, setInterestRate] = useState("");
+  const [repaymentAmount, setRepaymentAmount] = useState("");
+  const [repaymentFrequency, setRepaymentFrequency] = useState("");
+  const [repaymentFrequencyUnit, setRepaymentFrequencyUnit] = useState<
+    "days" | "weeks" | "months"
+  >("months");
+  const [rateExpiry, setRateExpiry] = useState("");
+  const [initialNextRepaymentDate, setInitialNextRepaymentDate] = useState("");
+  const [editingRepayment, setEditingRepayment] = useState(false);
+  const [savingRepayment, setSavingRepayment] = useState(false);
+  const [repaymentStatus, setRepaymentStatus] = useState<{
+    type: "success" | "error";
+    message: string;
+  } | null>(null);
 
   // Add value form state
   const [addValue, setAddValue] = useState("");
@@ -79,6 +96,22 @@ export default function AccountDetail() {
   useEffect(() => {
     loadHistory();
   }, [loadHistory]);
+
+  const resetRepaymentDraft = useCallback(() => {
+    if (!data) return;
+    setInterestRate(data.account.interest_rate?.toString() ?? "");
+    setRepaymentAmount(data.account.repayment_amount?.toString() ?? "");
+    setRepaymentFrequency(data.account.repayment_frequency?.toString() ?? "");
+    setRepaymentFrequencyUnit(data.account.repayment_frequency_unit ?? "months");
+    setRateExpiry(data.account.rate_expiry ?? "");
+    setInitialNextRepaymentDate(
+      data.next_repayment_date ?? data.account.initial_next_repayment_date ?? "",
+    );
+  }, [data]);
+
+  useEffect(() => {
+    resetRepaymentDraft();
+  }, [resetRepaymentDraft]);
 
   // Listen for remote DB changes (another machine wrote and iCloud synced it
   // down). Debounce: coalesce a burst of filesystem events into one reload.
@@ -157,6 +190,56 @@ export default function AccountDetail() {
     } finally {
       setDeleting(false);
     }
+  };
+
+  const handleSaveRepayment = async () => {
+    if (!id) return;
+    const parseOptionalNumber = (value: string, label: string) => {
+      if (!value.trim()) return null;
+      const number = Number(value);
+      if (!Number.isFinite(number)) throw new Error(`${label} must be a valid number`);
+      return number;
+    };
+
+    setSavingRepayment(true);
+    setRepaymentStatus(null);
+    try {
+      const frequency = parseOptionalNumber(repaymentFrequency, "Frequency");
+      if (frequency != null && !Number.isInteger(frequency)) {
+        throw new Error("Frequency must be a whole number");
+      }
+      const displayedNextRepaymentDate =
+        data?.next_repayment_date ?? data?.account.initial_next_repayment_date ?? "";
+      const repaymentDateAnchor =
+        initialNextRepaymentDate === displayedNextRepaymentDate
+          ? data?.account.initial_next_repayment_date ?? null
+          : initialNextRepaymentDate || null;
+      await invoke("update_liability_repayment", {
+        request: {
+          account_id: decodeURIComponent(id),
+          interest_rate: parseOptionalNumber(interestRate, "Interest rate"),
+          repayment_amount: parseOptionalNumber(repaymentAmount, "Repayment amount"),
+          repayment_frequency: frequency,
+          repayment_frequency_unit: frequency == null ? null : repaymentFrequencyUnit,
+          rate_expiry: rateExpiry || null,
+          initial_next_repayment_date: repaymentDateAnchor,
+        },
+      });
+      setRepaymentStatus({ type: "success", message: "Repayment details saved" });
+      setEditingRepayment(false);
+      await loadHistory();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setRepaymentStatus({ type: "error", message: `Error: ${message}` });
+    } finally {
+      setSavingRepayment(false);
+    }
+  };
+
+  const handleCancelRepaymentEdit = () => {
+    resetRepaymentDraft();
+    setRepaymentStatus(null);
+    setEditingRepayment(false);
   };
 
   const formatCurrency = (val: number | null | undefined) => {
@@ -305,8 +388,12 @@ export default function AccountDetail() {
       <div className="detail-stats">
         <div className="detail-stat">
           <div className="stat-label">Current Value</div>
-          <div className="stat-value stat-current">
-            {formatCurrency(data.current_balance)}
+          <div className="stat-value stat-current balance-with-direction">
+            <span>{formatCurrency(data.current_balance)}</span>
+            <BalanceDirection
+              current={data.current_balance}
+              previous={data.previous_balance}
+            />
           </div>
         </div>
         <div className="detail-stat">
@@ -328,6 +415,45 @@ export default function AccountDetail() {
           )}
         </div>
       </div>
+
+      {data.current_balance != null &&
+        data.current_balance < 0 &&
+        (data.account.id === "__liabilities_total__" ||
+          !data.account.id.startsWith("__")) && (
+          <div className="card liability-calculations">
+            <h3>
+              {data.account.id === "__liabilities_total__"
+                ? "Combined repayment calculations"
+                : "Repayment calculations"}
+            </h3>
+            <div className="detail-stats">
+              <div className="detail-stat">
+                <div className="stat-label">Next repayment</div>
+                <div className="stat-value">
+                  {data.next_repayment_date
+                    ? formatDate(data.next_repayment_date)
+                    : "—"}
+                </div>
+              </div>
+              <div className="detail-stat">
+                <div className="stat-label">Estimated repayment date</div>
+                <div className="stat-value">
+                  {data.estimated_repayment_date
+                    ? formatDate(data.estimated_repayment_date)
+                    : "—"}
+                </div>
+                {data.repayment_estimate_status && (
+                  <div className="stat-date">{data.repayment_estimate_status}</div>
+                )}
+              </div>
+            </div>
+            <p className="calculation-note">
+              {data.account.id === "__liabilities_total__"
+                ? "Derived from the included liability accounts. The combined payoff date is the latest individual estimate; each estimate assumes its current rate continues indefinitely and ignores rate expiry."
+                : "The estimate assumes the current interest rate continues indefinitely; the rate expiry is not used in this calculation."}
+            </p>
+          </div>
+      )}
 
       {/* Historical changes */}
       {changes.length > 0 && (
@@ -376,6 +502,178 @@ export default function AccountDetail() {
           </div>
         </div>
       )}
+
+      {data.current_balance != null &&
+        data.current_balance < 0 &&
+        !data.account.id.startsWith("__") && (
+          <div className="card liability-repayment-form">
+            <div className="repayment-details-header">
+              <h3>Repayment details</h3>
+              {!editingRepayment && (
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => {
+                    setRepaymentStatus(null);
+                    setEditingRepayment(true);
+                  }}
+                >
+                  Edit
+                </button>
+              )}
+            </div>
+
+            {editingRepayment ? (
+              <>
+                <p>All fields are optional. Complete all except rate expiry to calculate an estimate.</p>
+                <div className="repayment-form-grid">
+                  <div className="form-group">
+                    <label htmlFor="interestRate">Annual interest rate (%)</label>
+                    <input
+                      id="interestRate"
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      placeholder="e.g. 6.49"
+                      value={interestRate}
+                      onChange={(e) => setInterestRate(e.target.value)}
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label htmlFor="repaymentAmount">Repayment amount</label>
+                    <input
+                      id="repaymentAmount"
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      placeholder="0.00"
+                      value={repaymentAmount}
+                      onChange={(e) => setRepaymentAmount(e.target.value)}
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label htmlFor="repaymentFrequency">Repayment frequency</label>
+                    <div className="frequency-inputs">
+                      <input
+                        id="repaymentFrequency"
+                        type="number"
+                        min="1"
+                        step="1"
+                        placeholder="e.g. 2"
+                        value={repaymentFrequency}
+                        onChange={(e) => setRepaymentFrequency(e.target.value)}
+                      />
+                      <select
+                        aria-label="Repayment frequency unit"
+                        value={repaymentFrequencyUnit}
+                        onChange={(e) =>
+                          setRepaymentFrequencyUnit(
+                            e.target.value as "days" | "weeks" | "months",
+                          )
+                        }
+                      >
+                        <option value="days">days</option>
+                        <option value="weeks">weeks</option>
+                        <option value="months">months</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div className="form-group">
+                    <label htmlFor="initialNextRepaymentDate">Next payment date</label>
+                    <input
+                      id="initialNextRepaymentDate"
+                      type="date"
+                      value={initialNextRepaymentDate}
+                      onChange={(e) => setInitialNextRepaymentDate(e.target.value)}
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label htmlFor="rateExpiry">Rate expiry</label>
+                    <input
+                      id="rateExpiry"
+                      type="date"
+                      value={rateExpiry}
+                      onChange={(e) => setRateExpiry(e.target.value)}
+                    />
+                  </div>
+                </div>
+                <p className="calculation-note">
+                  The initial date anchors the schedule. The displayed next repayment
+                  automatically advances by the configured frequency as time passes.
+                </p>
+                <div className="repayment-actions">
+                  <button
+                    className="btn btn-primary"
+                    onClick={handleSaveRepayment}
+                    disabled={savingRepayment}
+                  >
+                    {savingRepayment ? "Saving..." : "Save repayment details"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={handleCancelRepaymentEdit}
+                    disabled={savingRepayment}
+                  >
+                    Cancel
+                  </button>
+                  {repaymentStatus && (
+                    <span className={`inline-status ${repaymentStatus.type}`}>
+                      {repaymentStatus.message}
+                    </span>
+                  )}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="repayment-readonly-grid">
+                  <div>
+                    <span>Annual interest rate</span>
+                    <strong>
+                      {data.account.interest_rate != null
+                        ? `${data.account.interest_rate}%`
+                        : "—"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span>Repayment amount</span>
+                    <strong>{formatCurrency(data.account.repayment_amount)}</strong>
+                  </div>
+                  <div>
+                    <span>Repayment frequency</span>
+                    <strong>
+                      {data.account.repayment_frequency != null &&
+                      data.account.repayment_frequency_unit
+                        ? `${data.account.repayment_frequency} ${data.account.repayment_frequency_unit}`
+                        : "—"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span>Next payment date</span>
+                    <strong>
+                      {data.next_repayment_date
+                        ? formatDate(data.next_repayment_date)
+                        : "—"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span>Rate expiry</span>
+                    <strong>
+                      {data.account.rate_expiry
+                        ? formatDate(data.account.rate_expiry)
+                        : "—"}
+                    </strong>
+                  </div>
+                </div>
+                {repaymentStatus && (
+                  <span className={`inline-status ${repaymentStatus.type}`}>
+                    {repaymentStatus.message}
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+        )}
 
       {/* Manual account: add value form */}
       {data.account.is_manual && (

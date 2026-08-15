@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, Local, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, Months, NaiveDate, Utc};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -48,6 +48,12 @@ pub struct Account {
     pub currency: String,
     pub is_manual: bool,
     pub is_ignored: bool,
+    pub interest_rate: Option<f64>,
+    pub repayment_amount: Option<f64>,
+    pub repayment_frequency: Option<u32>,
+    pub repayment_frequency_unit: Option<String>,
+    pub rate_expiry: Option<String>,
+    pub initial_next_repayment_date: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -62,6 +68,7 @@ pub struct AccountValue {
 pub struct AccountSummary {
     pub account: Account,
     pub latest_balance: Option<f64>,
+    pub previous_balance: Option<f64>,
     pub latest_date: Option<String>,
     pub max_balance: Option<f64>,
 }
@@ -71,10 +78,14 @@ pub struct AccountHistory {
     pub account: Account,
     pub values: Vec<AccountValue>,
     pub current_balance: Option<f64>,
+    pub previous_balance: Option<f64>,
     pub min_balance: Option<f64>,
     pub min_balance_date: Option<String>,
     pub max_balance: Option<f64>,
     pub max_balance_date: Option<String>,
+    pub next_repayment_date: Option<String>,
+    pub estimated_repayment_date: Option<String>,
+    pub repayment_estimate_status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +100,19 @@ pub struct AddManualValueRequest {
     pub account_id: String,
     pub balance: f64,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateLiabilityRepaymentRequest {
+    pub account_id: String,
+    pub interest_rate: Option<f64>,
+    pub repayment_amount: Option<f64>,
+    pub repayment_frequency: Option<u32>,
+    pub repayment_frequency_unit: Option<String>,
+    pub rate_expiry: Option<String>,
+    pub initial_next_repayment_date: Option<String>,
+}
+
+type RepaymentDateCalculation = (Option<String>, Option<String>, Option<String>);
 
 /// Return value for `delete_last_manual_value`: describes the row that was
 /// removed, so the UI can confirm what was undone.
@@ -158,6 +182,274 @@ fn init_db(conn: &Connection) {
         ",
     )
     .expect("Failed to initialize database");
+
+    // Additive migration for liability repayment details. SQLite's
+    // CREATE TABLE IF NOT EXISTS does not add columns to an existing DB, so
+    // each nullable column is introduced independently and safely on launch.
+    for (column, definition) in [
+        ("interest_rate", "REAL"),
+        ("repayment_amount", "REAL"),
+        ("repayment_frequency", "INTEGER"),
+        ("repayment_frequency_unit", "TEXT"),
+        ("rate_expiry", "TEXT"),
+        ("initial_next_repayment_date", "TEXT"),
+    ] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('accounts') WHERE name = ?1)",
+                rusqlite::params![column],
+                |row| row.get(0),
+            )
+            .expect("Failed to inspect accounts schema");
+        if !exists {
+            conn.execute(
+                &format!("ALTER TABLE accounts ADD COLUMN {} {}", column, definition),
+                [],
+            )
+            .expect("Failed to migrate liability repayment fields");
+        }
+    }
+}
+
+fn add_repayment_intervals(
+    anchor: NaiveDate,
+    frequency: u32,
+    unit: &str,
+    intervals: u64,
+) -> Option<NaiveDate> {
+    match unit {
+        "days" | "weeks" => {
+            let unit_days = if unit == "weeks" { 7_i64 } else { 1_i64 };
+            let days = i64::from(frequency)
+                .checked_mul(unit_days)?
+                .checked_mul(i64::try_from(intervals).ok()?)?;
+            anchor.checked_add_signed(Duration::days(days))
+        }
+        "months" => {
+            let months = u64::from(frequency).checked_mul(intervals)?;
+            anchor.checked_add_months(Months::new(u32::try_from(months).ok()?))
+        }
+        _ => None,
+    }
+}
+
+/// Advance the user-entered first repayment date to the first scheduled date
+/// on or after `today`. Each result is calculated from the original anchor so
+/// short months do not permanently shift a month-end schedule.
+fn current_next_repayment_date(
+    anchor: NaiveDate,
+    frequency: u32,
+    unit: &str,
+    today: NaiveDate,
+) -> Option<NaiveDate> {
+    if frequency == 0 || anchor >= today {
+        return (frequency > 0).then_some(anchor);
+    }
+
+    let intervals = match unit {
+        "days" | "weeks" => {
+            let step_days = i64::from(frequency) * if unit == "weeks" { 7 } else { 1 };
+            let elapsed_days = (today - anchor).num_days();
+            u64::try_from((elapsed_days + step_days - 1) / step_days).ok()?
+        }
+        "months" => {
+            let elapsed_months = i64::from(today.year() - anchor.year()) * 12
+                + i64::from(today.month())
+                - i64::from(anchor.month());
+            let mut intervals = u64::try_from(elapsed_months.max(0)).ok()? / u64::from(frequency);
+            if add_repayment_intervals(anchor, frequency, unit, intervals)? < today {
+                intervals += 1;
+            }
+            intervals
+        }
+        _ => return None,
+    };
+
+    add_repayment_intervals(anchor, frequency, unit, intervals)
+}
+
+fn calculate_repayment_dates(
+    account: &Account,
+    current_balance: Option<f64>,
+    today: NaiveDate,
+) -> RepaymentDateCalculation {
+    let Some(balance) = current_balance.filter(|balance| *balance < 0.0) else {
+        return (None, None, None);
+    };
+
+    let anchor = account
+        .initial_next_repayment_date
+        .as_deref()
+        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+    let next_date = match (
+        anchor,
+        account.repayment_frequency,
+        account.repayment_frequency_unit.as_deref(),
+    ) {
+        (Some(anchor), Some(frequency), Some(unit)) => {
+            current_next_repayment_date(anchor, frequency, unit, today)
+        }
+        _ => None,
+    };
+    let next_date_string = next_date.map(|date| date.format("%Y-%m-%d").to_string());
+
+    let (Some(annual_rate_percent), Some(payment), Some(frequency), Some(unit), Some(next_date)) = (
+        account.interest_rate,
+        account.repayment_amount,
+        account.repayment_frequency,
+        account.repayment_frequency_unit.as_deref(),
+        next_date,
+    ) else {
+        return (
+            next_date_string,
+            None,
+            Some(
+                "Add the interest rate, repayment amount, frequency and initial next repayment date to estimate repayment."
+                    .to_string(),
+            ),
+        );
+    };
+
+    let annual_rate = annual_rate_percent / 100.0;
+    if !annual_rate.is_finite() || annual_rate < 0.0 || !payment.is_finite() || payment <= 0.0 {
+        return (
+            next_date_string,
+            None,
+            Some("The repayment values must be positive valid numbers.".into()),
+        );
+    }
+    let period_rate = match unit {
+        "days" => annual_rate * f64::from(frequency) / 365.0,
+        "weeks" => annual_rate * f64::from(frequency) * 7.0 / 365.0,
+        "months" => annual_rate * f64::from(frequency) / 12.0,
+        _ => {
+            return (
+                next_date_string,
+                None,
+                Some("Invalid repayment frequency unit.".into()),
+            )
+        }
+    };
+    let principal = balance.abs();
+    let payment_count = if period_rate == 0.0 {
+        (principal / payment).ceil()
+    } else {
+        let first_period_interest = principal * period_rate;
+        if payment <= first_period_interest {
+            return (
+                next_date_string,
+                None,
+                Some("The repayment does not cover the interest charged each period.".into()),
+            );
+        }
+        (-(1.0 - period_rate * principal / payment).ln() / period_rate.ln_1p()).ceil()
+    };
+
+    if !payment_count.is_finite() || payment_count < 1.0 || payment_count > f64::from(u32::MAX) {
+        return (
+            next_date_string,
+            None,
+            Some("The repayment date could not be estimated from these values.".into()),
+        );
+    }
+    let payoff_date = add_repayment_intervals(next_date, frequency, unit, payment_count as u64 - 1);
+    match payoff_date {
+        Some(date) => (
+            next_date_string,
+            Some(date.format("%Y-%m-%d").to_string()),
+            None,
+        ),
+        None => (
+            next_date_string,
+            None,
+            Some("The estimated repayment date is outside the supported date range.".into()),
+        ),
+    }
+}
+
+fn calculate_liabilities_total_repayment_dates(
+    conn: &Connection,
+    today: NaiveDate,
+) -> Result<RepaymentDateCalculation, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT a.id, a.name, a.type, a.institution, a.currency, a.is_manual, a.is_ignored,
+                a.interest_rate, a.repayment_amount, a.repayment_frequency,
+                a.repayment_frequency_unit, a.rate_expiry, a.initial_next_repayment_date,
+                av.balance
+         FROM accounts a
+         JOIN (
+             SELECT account_id, balance
+             FROM (
+                 SELECT account_id, balance,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY account_id
+                            ORDER BY recorded_date DESC, id DESC
+                        ) AS rn
+                 FROM account_values
+             )
+             WHERE rn = 1
+         ) av ON av.account_id = a.id
+         WHERE a.is_ignored = 0
+           AND a.id NOT IN ('__total__', '__assets_total__', '__liabilities_total__')
+           AND av.balance < 0
+         ORDER BY a.name",
+    )?;
+
+    let liabilities = stmt
+        .query_map([], |row| {
+            Ok((
+                Account {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    account_type: row.get(2)?,
+                    institution: row.get(3)?,
+                    currency: row.get(4)?,
+                    is_manual: row.get::<_, i32>(5)? != 0,
+                    is_ignored: row.get::<_, i32>(6)? != 0,
+                    interest_rate: row.get(7)?,
+                    repayment_amount: row.get(8)?,
+                    repayment_frequency: row.get(9)?,
+                    repayment_frequency_unit: row.get(10)?,
+                    rate_expiry: row.get(11)?,
+                    initial_next_repayment_date: row.get(12)?,
+                },
+                row.get::<_, f64>(13)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if liabilities.is_empty() {
+        return Ok((None, None, None));
+    }
+
+    let mut next_dates = Vec::new();
+    let mut payoff_dates = Vec::new();
+    let mut incomplete_accounts = Vec::new();
+    for (account, balance) in liabilities {
+        let (next_date, payoff_date, _) = calculate_repayment_dates(&account, Some(balance), today);
+        if let Some(next_date) = next_date {
+            next_dates.push(next_date);
+        }
+        if let Some(payoff_date) = payoff_date {
+            payoff_dates.push(payoff_date);
+        } else {
+            incomplete_accounts.push(account.name);
+        }
+    }
+
+    let next_date = next_dates.into_iter().min();
+    if incomplete_accounts.is_empty() {
+        Ok((next_date, payoff_dates.into_iter().max(), None))
+    } else {
+        Ok((
+            next_date,
+            None,
+            Some(format!(
+                "Complete valid repayment details for: {}.",
+                incomplete_accounts.join(", ")
+            )),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -313,13 +605,68 @@ fn merge_one_conflict(
     let _ = conn.execute("DETACH DATABASE other", []);
     conn.execute("ATTACH DATABASE ?1 AS other", rusqlite::params![path_str])?;
 
-    // accounts: union by id, keep live on collision.
-    conn.execute(
-        "INSERT OR IGNORE INTO accounts
-           SELECT id, name, type, institution, currency, is_manual, is_ignored
-           FROM other.accounts",
-        [],
-    )?;
+    // accounts: union by id, keep live on collision. Conflict copies made by
+    // an older app version do not have the repayment columns, so inspect the
+    // attached schema before selecting them.
+    let other_account_columns = {
+        let mut stmt = conn.prepare("PRAGMA other.table_info(accounts)")?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        columns
+    };
+    let has_repayment_columns = [
+        "interest_rate",
+        "repayment_amount",
+        "repayment_frequency",
+        "repayment_frequency_unit",
+        "rate_expiry",
+        "initial_next_repayment_date",
+    ]
+    .iter()
+    .all(|column| other_account_columns.iter().any(|other| other == column));
+    if has_repayment_columns {
+        conn.execute(
+            "INSERT OR IGNORE INTO accounts
+               (id, name, type, institution, currency, is_manual, is_ignored,
+                interest_rate, repayment_amount, repayment_frequency,
+                repayment_frequency_unit, rate_expiry, initial_next_repayment_date)
+             SELECT id, name, type, institution, currency, is_manual, is_ignored,
+                    interest_rate, repayment_amount, repayment_frequency,
+                    repayment_frequency_unit, rate_expiry, initial_next_repayment_date
+             FROM other.accounts",
+            [],
+        )?;
+        // A conflict copy may contain repayment details for an account that
+        // already exists in the live DB. Fill only live nulls so those details
+        // are not lost while preserving the established keep-live rule when
+        // both copies contain a value.
+        conn.execute(
+            "UPDATE accounts AS live SET
+                interest_rate = COALESCE(interest_rate, (
+                    SELECT interest_rate FROM other.accounts WHERE id = live.id)),
+                repayment_amount = COALESCE(repayment_amount, (
+                    SELECT repayment_amount FROM other.accounts WHERE id = live.id)),
+                repayment_frequency = COALESCE(repayment_frequency, (
+                    SELECT repayment_frequency FROM other.accounts WHERE id = live.id)),
+                repayment_frequency_unit = COALESCE(repayment_frequency_unit, (
+                    SELECT repayment_frequency_unit FROM other.accounts WHERE id = live.id)),
+                rate_expiry = COALESCE(rate_expiry, (
+                    SELECT rate_expiry FROM other.accounts WHERE id = live.id)),
+                initial_next_repayment_date = COALESCE(initial_next_repayment_date, (
+                    SELECT initial_next_repayment_date FROM other.accounts WHERE id = live.id))
+             WHERE EXISTS (SELECT 1 FROM other.accounts WHERE id = live.id)",
+            [],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT OR IGNORE INTO accounts
+               (id, name, type, institution, currency, is_manual, is_ignored)
+             SELECT id, name, type, institution, currency, is_manual, is_ignored
+             FROM other.accounts",
+            [],
+        )?;
+    }
 
     // account_values: union by (account_id, recorded_date). On collision keep
     // live. Same-day real-account values come from the same Akahu source so are
@@ -630,6 +977,19 @@ async fn wait_for_refresh(
     }
 }
 
+async fn wait_for_refresh_with_timeout<F>(
+    refresh_wait: F,
+    timeout_secs: u64,
+) -> Result<bool, String>
+where
+    F: std::future::Future<Output = Result<bool, String>>,
+{
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), refresh_wait).await {
+        Ok(result) => result,
+        Err(_) => Ok(false),
+    }
+}
+
 async fn fetch_akahu_accounts(app_id: &str, user_token: &str) -> Result<Vec<AkahuAccount>, String> {
     let client = reqwest::Client::new();
     let resp = client
@@ -671,6 +1031,7 @@ async fn fetch_akahu_accounts(app_id: &str, user_token: &str) -> Result<Vec<Akah
 }
 
 const MAX_ACCEPTABLE_BALANCE_AGE_MINUTES: i64 = 65;
+const REFRESH_JOB_TIMEOUT_SECS: u64 = 120;
 const ACCOUNT_FRESHNESS_TIMEOUT_SECS: u64 = 30;
 const ACCOUNT_FRESHNESS_POLL_SECS: u64 = 3;
 
@@ -757,6 +1118,10 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
+fn previous_stored_balance(values: &[AccountValue]) -> Option<f64> {
+    values.iter().rev().nth(1).map(|value| value.balance)
+}
+
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
@@ -785,14 +1150,20 @@ async fn fetch_akahu_balances(state: State<'_, AppState>, force: bool) -> Result
         }
     }
 
-    // Trigger and wait when Akahu creates a refresh job. Source balance
-    // timestamps are validated below whether or not a job is returned.
-    if let Some(refresh_id) = trigger_akahu_refresh(&app_id, &user_token).await? {
-        let completed = wait_for_refresh(&app_id, &user_token, &refresh_id, 120).await?;
-        if !completed {
-            return Err("Refresh timed out".to_string());
-        }
-    }
+    // Trigger and wait when Akahu creates a refresh job. Bound the whole wait,
+    // including an individual status request that stalls. A timeout is not a
+    // failed fetch: fall back to the account data Akahu currently has cached.
+    // Explicit refresh errors still fail so they are not silently hidden.
+    let refresh_timed_out =
+        if let Some(refresh_id) = trigger_akahu_refresh(&app_id, &user_token).await? {
+            !wait_for_refresh_with_timeout(
+                wait_for_refresh(&app_id, &user_token, &refresh_id, REFRESH_JOB_TIMEOUT_SECS),
+                REFRESH_JOB_TIMEOUT_SECS,
+            )
+            .await?
+        } else {
+            false
+        };
 
     // Akahu serves account reads from its cache, and a completed refresh job can
     // become visible there asynchronously. Poll until every refreshable NZD
@@ -800,9 +1171,13 @@ async fn fetch_akahu_balances(state: State<'_, AppState>, force: bool) -> Result
     // refresh rest period is one hour; the extra five minutes avoids rejecting
     // a just-within-window result due to clock or request latency. If freshness
     // cannot be verified, return before writing values or today's fetch marker
-    // so the user can retry.
-    let accounts =
-        fetch_fresh_akahu_accounts(&app_id, &user_token, ACCOUNT_FRESHNESS_TIMEOUT_SECS).await?;
+    // so the user can retry. When the refresh job itself timed out, skip this
+    // second wait and save whatever account data is already available instead.
+    let accounts = if refresh_timed_out {
+        fetch_akahu_accounts(&app_id, &user_token).await?
+    } else {
+        fetch_fresh_akahu_accounts(&app_id, &user_token, ACCOUNT_FRESHNESS_TIMEOUT_SECS).await?
+    };
     let fetched_at = Utc::now().to_rfc3339();
 
     // Filter to refreshable NZD accounts. Inactive accounts remain in history
@@ -875,7 +1250,14 @@ async fn fetch_akahu_balances(state: State<'_, AppState>, force: bool) -> Result
         tx.commit().map_err(|e| e.to_string())
     })?;
 
-    Ok(format!("Fetched {} NZD accounts", nzd_accounts.len()))
+    if refresh_timed_out {
+        Ok(format!(
+            "Akahu refresh timed out; fetched {} NZD accounts from available data",
+            nzd_accounts.len()
+        ))
+    } else {
+        Ok(format!("Fetched {} NZD accounts", nzd_accounts.len()))
+    }
 }
 
 #[tauri::command]
@@ -884,8 +1266,14 @@ fn get_accounts_summary(state: State<'_, AppState>) -> Result<Vec<AccountSummary
         let mut stmt = db
             .prepare(
                 "SELECT a.id, a.name, a.type, a.institution, a.currency, a.is_manual, a.is_ignored,
+                        a.interest_rate, a.repayment_amount, a.repayment_frequency,
+                        a.repayment_frequency_unit, a.rate_expiry, a.initial_next_repayment_date,
                         av.balance, av.recorded_date,
-                        (SELECT MAX(balance) FROM account_values WHERE account_id = a.id) AS max_balance
+                        (SELECT MAX(balance) FROM account_values WHERE account_id = a.id) AS max_balance,
+                        (SELECT balance FROM account_values
+                         WHERE account_id = a.id
+                         ORDER BY recorded_date DESC, id DESC
+                         LIMIT 1 OFFSET 1) AS previous_balance
                  FROM accounts a
                  LEFT JOIN (
                      SELECT account_id, balance, recorded_date
@@ -919,10 +1307,17 @@ fn get_accounts_summary(state: State<'_, AppState>) -> Result<Vec<AccountSummary
                         currency: row.get(4)?,
                         is_manual: row.get::<_, i32>(5)? != 0,
                         is_ignored: row.get::<_, i32>(6)? != 0,
+                        interest_rate: row.get(7)?,
+                        repayment_amount: row.get(8)?,
+                        repayment_frequency: row.get(9)?,
+                        repayment_frequency_unit: row.get(10)?,
+                        rate_expiry: row.get(11)?,
+                        initial_next_repayment_date: row.get(12)?,
                     },
-                    latest_balance: row.get(7)?,
-                    latest_date: row.get(8)?,
-                    max_balance: row.get(9)?,
+                    latest_balance: row.get(13)?,
+                    latest_date: row.get(14)?,
+                    max_balance: row.get(15)?,
+                    previous_balance: row.get(16)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -942,7 +1337,9 @@ fn get_account_history(
         // Get account info
         let account = db
             .query_row(
-                "SELECT id, name, type, institution, currency, is_manual, is_ignored
+                "SELECT id, name, type, institution, currency, is_manual, is_ignored,
+                        interest_rate, repayment_amount, repayment_frequency,
+                        repayment_frequency_unit, rate_expiry, initial_next_repayment_date
                  FROM accounts WHERE id = ?1",
                 rusqlite::params![account_id],
                 |row| {
@@ -954,6 +1351,12 @@ fn get_account_history(
                         currency: row.get(4)?,
                         is_manual: row.get::<_, i32>(5)? != 0,
                         is_ignored: row.get::<_, i32>(6)? != 0,
+                        interest_rate: row.get(7)?,
+                        repayment_amount: row.get(8)?,
+                        repayment_frequency: row.get(9)?,
+                        repayment_frequency_unit: row.get(10)?,
+                        rate_expiry: row.get(11)?,
+                        initial_next_repayment_date: row.get(12)?,
                     })
                 },
             )
@@ -983,6 +1386,7 @@ fn get_account_history(
             .map_err(|e| e.to_string())?;
 
         let current_balance = values.last().map(|v| v.balance);
+        let previous_balance = previous_stored_balance(&values);
         let min_balance = values
             .iter()
             .map(|v| v.balance)
@@ -1014,10 +1418,19 @@ fn get_account_history(
             None
         };
 
+        let (next_repayment_date, estimated_repayment_date, repayment_estimate_status) =
+            if account.id == "__liabilities_total__" {
+                calculate_liabilities_total_repayment_dates(db, Local::now().date_naive())
+                    .map_err(|e| e.to_string())?
+            } else {
+                calculate_repayment_dates(&account, current_balance, Local::now().date_naive())
+            };
+
         Ok(AccountHistory {
             account,
             values,
             current_balance,
+            previous_balance,
             min_balance: if min_balance.is_finite() {
                 Some(min_balance)
             } else {
@@ -1030,6 +1443,9 @@ fn get_account_history(
                 None
             },
             max_balance_date,
+            next_repayment_date,
+            estimated_repayment_date,
+            repayment_estimate_status,
         })
     })
 }
@@ -1039,7 +1455,9 @@ fn get_all_accounts_config(state: State<'_, AppState>) -> Result<Vec<Account>, S
     with_db_ro(&state, |db| {
         let mut stmt = db
             .prepare(
-                "SELECT id, name, type, institution, currency, is_manual, is_ignored
+                "SELECT id, name, type, institution, currency, is_manual, is_ignored,
+                        interest_rate, repayment_amount, repayment_frequency,
+                        repayment_frequency_unit, rate_expiry, initial_next_repayment_date
                  FROM accounts
                  WHERE id NOT IN ('__total__', '__assets_total__', '__liabilities_total__')
                  ORDER BY is_manual, institution, name",
@@ -1056,6 +1474,12 @@ fn get_all_accounts_config(state: State<'_, AppState>) -> Result<Vec<Account>, S
                     currency: row.get(4)?,
                     is_manual: row.get::<_, i32>(5)? != 0,
                     is_ignored: row.get::<_, i32>(6)? != 0,
+                    interest_rate: row.get(7)?,
+                    repayment_amount: row.get(8)?,
+                    repayment_frequency: row.get(9)?,
+                    repayment_frequency_unit: row.get(10)?,
+                    rate_expiry: row.get(11)?,
+                    initial_next_repayment_date: row.get(12)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -1126,10 +1550,102 @@ fn add_manual_account(
             currency: "NZD".to_string(),
             is_manual: true,
             is_ignored: false,
+            interest_rate: None,
+            repayment_amount: None,
+            repayment_frequency: None,
+            repayment_frequency_unit: None,
+            rate_expiry: None,
+            initial_next_repayment_date: None,
         })
     })?;
 
     Ok(account)
+}
+
+#[tauri::command]
+fn update_liability_repayment(
+    state: State<'_, AppState>,
+    request: UpdateLiabilityRepaymentRequest,
+) -> Result<(), String> {
+    if request.account_id.starts_with("__") {
+        return Err("Repayment details cannot be set on a total account".to_string());
+    }
+    if let Some(rate) = request.interest_rate {
+        if !rate.is_finite() || rate < 0.0 {
+            return Err("Interest rate must be zero or greater".to_string());
+        }
+    }
+    if let Some(amount) = request.repayment_amount {
+        if !amount.is_finite() || amount <= 0.0 {
+            return Err("Repayment amount must be greater than zero".to_string());
+        }
+    }
+    if matches!(request.repayment_frequency, Some(0)) {
+        return Err("Repayment frequency must be greater than zero".to_string());
+    }
+    match (
+        request.repayment_frequency,
+        request.repayment_frequency_unit.as_deref(),
+    ) {
+        (Some(_), Some("days" | "weeks" | "months")) | (None, None) => {}
+        (Some(_), _) => return Err("Choose days, weeks or months for the frequency".to_string()),
+        (None, Some(_)) => return Err("Enter a repayment frequency".to_string()),
+    }
+    for (label, value) in [
+        ("Rate expiry", request.rate_expiry.as_deref()),
+        (
+            "Initial next repayment date",
+            request.initial_next_repayment_date.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value {
+            let parsed = NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .map_err(|_| format!("{} must be a valid date", label))?;
+            if parsed.format("%Y-%m-%d").to_string() != value {
+                return Err(format!("{} must use YYYY-MM-DD format", label));
+            }
+        }
+    }
+
+    with_db_rw(&state, |db| {
+        let current_balance: Option<f64> = db
+            .query_row(
+                "SELECT (
+                    SELECT balance FROM account_values
+                    WHERE account_id = a.id
+                    ORDER BY recorded_date DESC, id DESC LIMIT 1
+                 )
+                 FROM accounts a WHERE a.id = ?1",
+                rusqlite::params![request.account_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Account not found: {}", e))?;
+        if !matches!(current_balance, Some(balance) if balance < 0.0) {
+            return Err("Repayment details can only be set for a liability account".to_string());
+        }
+
+        db.execute(
+            "UPDATE accounts SET
+                interest_rate = ?2,
+                repayment_amount = ?3,
+                repayment_frequency = ?4,
+                repayment_frequency_unit = ?5,
+                rate_expiry = ?6,
+                initial_next_repayment_date = ?7
+             WHERE id = ?1",
+            rusqlite::params![
+                request.account_id,
+                request.interest_rate,
+                request.repayment_amount,
+                request.repayment_frequency,
+                request.repayment_frequency_unit,
+                request.rate_expiry,
+                request.initial_next_repayment_date,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -2116,6 +2632,286 @@ mod tests {
         conn
     }
 
+    fn liability_account(
+        interest_rate: Option<f64>,
+        repayment_amount: Option<f64>,
+        frequency: Option<u32>,
+        unit: Option<&str>,
+        next_date: Option<&str>,
+    ) -> Account {
+        Account {
+            id: "liability-1".into(),
+            name: "Test Liability".into(),
+            account_type: "LOAN".into(),
+            institution: "Test Bank".into(),
+            currency: "NZD".into(),
+            is_manual: false,
+            is_ignored: false,
+            interest_rate,
+            repayment_amount,
+            repayment_frequency: frequency,
+            repayment_frequency_unit: unit.map(str::to_string),
+            rate_expiry: Some("2026-12-31".into()),
+            initial_next_repayment_date: next_date.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn liability_schema_migration_adds_nullable_fields_to_existing_accounts_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE accounts (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL DEFAULT '',
+                institution TEXT NOT NULL DEFAULT '', currency TEXT NOT NULL DEFAULT 'NZD',
+                is_manual INTEGER NOT NULL DEFAULT 0, is_ignored INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .unwrap();
+
+        init_db(&conn);
+        let columns = {
+            let mut stmt = conn.prepare("PRAGMA table_info(accounts)").unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        for expected in [
+            "interest_rate",
+            "repayment_amount",
+            "repayment_frequency",
+            "repayment_frequency_unit",
+            "rate_expiry",
+            "initial_next_repayment_date",
+        ] {
+            assert!(columns.iter().any(|column| column == expected));
+        }
+    }
+
+    #[test]
+    fn next_repayment_advances_from_anchor_without_month_end_drift() {
+        let anchor = NaiveDate::from_ymd_opt(2026, 1, 31).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+        assert_eq!(
+            current_next_repayment_date(anchor, 1, "months", today),
+            NaiveDate::from_ymd_opt(2026, 3, 31)
+        );
+    }
+
+    #[test]
+    fn zero_interest_payoff_date_counts_from_next_scheduled_payment() {
+        let account = liability_account(
+            Some(0.0),
+            Some(250.0),
+            Some(1),
+            Some("months"),
+            Some("2026-08-20"),
+        );
+        let result = calculate_repayment_dates(
+            &account,
+            Some(-1_000.0),
+            NaiveDate::from_ymd_opt(2026, 8, 13).unwrap(),
+        );
+        assert_eq!(result.0.as_deref(), Some("2026-08-20"));
+        assert_eq!(result.1.as_deref(), Some("2026-11-20"));
+        assert_eq!(result.2, None);
+    }
+
+    #[test]
+    fn payoff_estimate_uses_current_rate_after_rate_expiry() {
+        let account = liability_account(
+            Some(12.0),
+            Some(100.0),
+            Some(1),
+            Some("months"),
+            Some("2027-01-20"),
+        );
+        let result = calculate_repayment_dates(
+            &account,
+            Some(-1_000.0),
+            NaiveDate::from_ymd_opt(2027, 1, 13).unwrap(),
+        );
+        assert_eq!(result.0.as_deref(), Some("2027-01-20"));
+        assert!(result.1.is_some());
+        assert_eq!(result.2, None);
+    }
+
+    #[test]
+    fn payoff_estimate_rejects_negative_amortization() {
+        let account = liability_account(
+            Some(12.0),
+            Some(5.0),
+            Some(1),
+            Some("months"),
+            Some("2026-08-20"),
+        );
+        let result = calculate_repayment_dates(
+            &account,
+            Some(-1_000.0),
+            NaiveDate::from_ymd_opt(2026, 8, 13).unwrap(),
+        );
+        assert_eq!(result.0.as_deref(), Some("2026-08-20"));
+        assert_eq!(result.1, None);
+        assert_eq!(
+            result.2.as_deref(),
+            Some("The repayment does not cover the interest charged each period.")
+        );
+    }
+
+    #[test]
+    fn liabilities_total_dates_are_derived_from_included_accounts() {
+        let conn = test_db();
+        conn.execute_batch(
+            "INSERT INTO accounts
+                (id, name, interest_rate, repayment_amount, repayment_frequency,
+                 repayment_frequency_unit, initial_next_repayment_date)
+             VALUES
+                ('loan-a', 'Monthly Loan', 0, 500, 1, 'months', '2026-08-20'),
+                ('loan-b', 'Weekly Loan', 0, 200, 1, 'weeks', '2026-08-15'),
+                ('ignored-loan', 'Ignored Loan', NULL, NULL, NULL, NULL, NULL);
+             UPDATE accounts SET is_ignored = 1 WHERE id = 'ignored-loan';
+             INSERT INTO account_values (account_id, balance, recorded_date)
+             VALUES
+                ('loan-a', -1000, '2026-08-13'),
+                ('loan-b', -600, '2026-08-13'),
+                ('ignored-loan', -900, '2026-08-13');",
+        )
+        .unwrap();
+
+        let result = calculate_liabilities_total_repayment_dates(
+            &conn,
+            NaiveDate::from_ymd_opt(2026, 8, 13).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result.0.as_deref(), Some("2026-08-15"));
+        assert_eq!(result.1.as_deref(), Some("2026-09-20"));
+        assert_eq!(result.2, None);
+
+        conn.execute_batch(
+            "INSERT INTO accounts (id, name) VALUES ('loan-c', 'Incomplete Loan');
+             INSERT INTO account_values (account_id, balance, recorded_date)
+             VALUES ('loan-c', -100, '2026-08-13');",
+        )
+        .unwrap();
+        let incomplete = calculate_liabilities_total_repayment_dates(
+            &conn,
+            NaiveDate::from_ymd_opt(2026, 8, 13).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(incomplete.0.as_deref(), Some("2026-08-15"));
+        assert_eq!(incomplete.1, None);
+        assert_eq!(
+            incomplete.2.as_deref(),
+            Some("Complete valid repayment details for: Incomplete Loan.")
+        );
+    }
+
+    #[test]
+    fn conflict_merge_fills_missing_repayment_details() {
+        let live_path =
+            std::env::temp_dir().join(format!("my-finances-live-{}.db", uuid::Uuid::new_v4()));
+        let conflict_path =
+            std::env::temp_dir().join(format!("my-finances-conflict-{}.db", uuid::Uuid::new_v4()));
+        {
+            let live = Connection::open(&live_path).unwrap();
+            init_db(&live);
+            live.execute(
+                "INSERT INTO accounts (id, name) VALUES ('loan-1', 'Loan')",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let conflict = Connection::open(&conflict_path).unwrap();
+            init_db(&conflict);
+            conflict
+                .execute(
+                    "INSERT INTO accounts
+                        (id, name, interest_rate, repayment_amount, repayment_frequency,
+                         repayment_frequency_unit, initial_next_repayment_date)
+                     VALUES ('loan-1', 'Loan', 6.5, 500, 2, 'weeks', '2026-08-20')",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let live = Connection::open(&live_path).unwrap();
+        merge_one_conflict(&live, &conflict_path).unwrap();
+        let details: (f64, f64, u32, String, String) = live
+            .query_row(
+                "SELECT interest_rate, repayment_amount, repayment_frequency,
+                        repayment_frequency_unit, initial_next_repayment_date
+                 FROM accounts WHERE id = 'loan-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            details,
+            (6.5, 500.0, 2, "weeks".into(), "2026-08-20".into())
+        );
+
+        drop(live);
+        let _ = fs::remove_file(live_path);
+        let _ = fs::remove_file(conflict_path);
+    }
+
+    #[test]
+    fn conflict_merge_accepts_pre_repayment_schema() {
+        let live_path =
+            std::env::temp_dir().join(format!("my-finances-live-old-{}.db", uuid::Uuid::new_v4()));
+        let conflict_path = std::env::temp_dir().join(format!(
+            "my-finances-conflict-old-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let live = Connection::open(&live_path).unwrap();
+            init_db(&live);
+        }
+        {
+            let conflict = Connection::open(&conflict_path).unwrap();
+            conflict
+                .execute_batch(
+                    "CREATE TABLE accounts (
+                        id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL DEFAULT '',
+                        institution TEXT NOT NULL DEFAULT '', currency TEXT NOT NULL DEFAULT 'NZD',
+                        is_manual INTEGER NOT NULL DEFAULT 0, is_ignored INTEGER NOT NULL DEFAULT 0
+                     );
+                     CREATE TABLE account_values (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
+                        balance REAL NOT NULL, recorded_date TEXT NOT NULL
+                     );
+                     CREATE TABLE fetch_log (id INTEGER PRIMARY KEY AUTOINCREMENT, fetched_at TEXT NOT NULL);
+                     CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                     INSERT INTO accounts (id, name) VALUES ('old-account', 'Old Account');",
+                )
+                .unwrap();
+        }
+
+        let live = Connection::open(&live_path).unwrap();
+        merge_one_conflict(&live, &conflict_path).unwrap();
+        let name: String = live
+            .query_row(
+                "SELECT name FROM accounts WHERE id = 'old-account'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "Old Account");
+
+        drop(live);
+        let _ = fs::remove_file(live_path);
+        let _ = fs::remove_file(conflict_path);
+    }
+
     #[test]
     fn daily_value_upsert_replaces_same_day_value() {
         let conn = test_db();
@@ -2132,6 +2928,33 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(balance, 20.0);
+    }
+
+    #[test]
+    fn previous_balance_uses_the_second_newest_stored_value() {
+        let values = vec![
+            AccountValue {
+                id: 1,
+                account_id: "account-1".into(),
+                balance: 10.0,
+                recorded_date: "2026-08-13".into(),
+            },
+            AccountValue {
+                id: 2,
+                account_id: "account-1".into(),
+                balance: 20.0,
+                recorded_date: "2026-08-14".into(),
+            },
+            AccountValue {
+                id: 3,
+                account_id: "account-1".into(),
+                balance: 30.0,
+                recorded_date: "2026-08-15".into(),
+            },
+        ];
+
+        assert_eq!(previous_stored_balance(&values), Some(20.0));
+        assert_eq!(previous_stored_balance(&values[..1]), None);
     }
 
     #[test]
@@ -2191,6 +3014,16 @@ mod tests {
         ];
 
         assert!(balance_freshness_issues(&accounts, now, Duration::minutes(65)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_wait_timeout_is_a_non_fatal_incomplete_result() {
+        let completed =
+            wait_for_refresh_with_timeout(std::future::pending::<Result<bool, String>>(), 0)
+                .await
+                .unwrap();
+
+        assert!(!completed);
     }
 
     #[test]
@@ -2345,6 +3178,7 @@ pub fn run() {
             get_all_accounts_config,
             toggle_ignore_account,
             add_manual_account,
+            update_liability_repayment,
             add_manual_account_value,
             delete_last_manual_value,
             has_akahu_credentials,

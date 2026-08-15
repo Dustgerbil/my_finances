@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { AccountSummary, AccountChange } from "../types";
 import { formatAccountType } from "../format";
+import BalanceDirection from "../components/BalanceDirection";
 
 export default function Dashboard() {
   const navigate = useNavigate();
@@ -182,8 +183,12 @@ export default function Dashboard() {
           {item.account.institution}
           {item.account.type ? ` · ${formatAccountType(item.account.type)}` : ""}
         </div>
-        <div className="account-balance">
-          {formatCurrency(item.latest_balance)}
+        <div className="account-balance balance-with-direction">
+          <span>{formatCurrency(item.latest_balance)}</span>
+          <BalanceDirection
+            current={item.latest_balance}
+            previous={item.previous_balance}
+          />
         </div>
         {item.latest_date && (
           <div className="account-date">

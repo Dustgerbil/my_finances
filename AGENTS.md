@@ -128,7 +128,11 @@ Production builds are signed with the self-signed identity
 
 ## Data model (SQLite)
 
-- `accounts(id PK, name, type, institution, currency, is_manual, is_ignored)`
+- `accounts(id PK, name, type, institution, currency, is_manual, is_ignored,
+  interest_rate, repayment_amount, repayment_frequency,
+  repayment_frequency_unit, rate_expiry, initial_next_repayment_date)` — the
+  repayment fields are nullable and only apply to accounts whose latest balance
+  is negative.
 - `account_values(id PK, account_id FK, balance REAL, recorded_date TEXT 'YYYY-MM-DD')`
 - `fetch_log(id PK, fetched_at TEXT 'YYYY-MM-DD')` — one row per successful fetch day
 - `settings(key PK, value TEXT)` — keys: `autofetch` (`"true"`|`"false"`),
@@ -145,6 +149,12 @@ Three synthetic rows live in `accounts` with ids `__total__`,
 values are **derived** by summing real account balances. They appear as cards on
 the dashboard (Total, Assets & Savings subtotal, Liabilities subtotal) and each
 has its own history graph.
+
+The Liabilities subtotal never has editable repayment terms. Its next repayment
+is the earliest derived next date among its included liability accounts, and its
+estimated payoff is the latest individual payoff date. If any included liability
+lacks a valid estimate, the subtotal has no payoff estimate and identifies the
+accounts that need repayment details.
 
 **One value per day per account is the intended model** (spec: "saves no more
 than once a day"). Automatic fetches early-return `"Already fetched today"` if
@@ -169,6 +179,7 @@ graphs zig-zag vertically and look "stale". (See history fix, 2026-06-18.)
 | `get_account_changes` | 30d/180d/360d/all-time change chips (lookback by recorded_date). |
 | `get_all_accounts_config` | All real accounts (excl. virtual) for config screen. |
 | `toggle_ignore_account` | Flip `is_ignored`; recomputes totals. Virtual accounts rejected. |
+| `update_liability_repayment` | Store optional repayment terms for an account whose latest balance is negative. |
 | `add_manual_account` | Insert manual account row. |
 | `add_manual_account_value` | Insert today's value for a manual account; recomputes totals. |
 | `has_akahu_credentials` / `save_akahu_credentials` | keychain read/write. |
@@ -193,8 +204,16 @@ graphs zig-zag vertically and look "stale". (See history fix, 2026-06-18.)
   Akahu refresh job completes, the backend polls `/v1/accounts` until each
   refreshable NZD account's `refreshed.balance` timestamp is no more than 65
   minutes old. If freshness cannot be verified within 30 seconds, it writes no
-  account values or daily fetch marker, so the request can be retried.
+  account values or daily fetch marker, so the request can be retried. If the
+  refresh job itself does not finish within 120 seconds, the app stops waiting,
+  fetches the account data Akahu currently has available, and identifies that
+  fallback in the success message.
 - **Max-balance ⭐ badge:** shown on a card when `latest_balance == max_balance`.
+- **Balance direction:** Dashboard balances and Account Detail's Current Value
+  compare the newest stored value with the immediately preceding stored value:
+  up arrow for higher, down arrow for lower, and a bar for unchanged. With fewer
+  than two values, no direction is shown. Same-day refreshes replace today's
+  value, so the comparison remains against the previous saved day.
 - **Ignore:** ignored accounts are hidden from the dashboard *and* excluded from
   virtual total sums.
 - **Changes lookback:** `get_account_changes` returns `None` for a fixed period
