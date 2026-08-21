@@ -28,8 +28,8 @@ and never touches a third-party server.
 
 - **One-click balance refresh** — requests live balances from Akahu and verifies
   their source refresh timestamps before storing the daily snapshot. If the
-  refresh job times out, it gracefully falls back to the account data Akahu has
-  available instead of failing the whole fetch.
+  refresh job or balance-freshness check times out, it gracefully falls back to
+  the account data Akahu has available instead of failing the whole fetch.
 - **Dashboard** — a card per account showing current balance, direction since
   the previous saved value, and 30/180/360-day change chips, plus virtual
   "Total", "Assets & Savings", and "Liabilities" sub-total cards. The same

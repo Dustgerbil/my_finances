@@ -48,6 +48,19 @@ body {
   gap: 8px;
 }
 
+.page-header {
+  margin-bottom: 24px;
+}
+
+.page-header h1 {
+  font-size: 1.5rem;
+}
+
+.page-header p {
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+
 /* Buttons */
 .btn {
   padding: 8px 16px;
@@ -170,17 +183,118 @@ body {
   color: var(--danger);
 }
 
-.balance-direction.flat {
-  color: var(--text-secondary);
-}
-
 .account-card .account-date {
   font-size: 0.75rem;
   color: var(--text-secondary);
   margin-top: 4px;
 }
 
+.other-account-card .account-name {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.other-account-card .account-institution {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  margin-bottom: 8px;
+}
+
+.other-account-card .account-balance {
+  color: var(--accent);
+  font-size: 1.25rem;
+  font-weight: 700;
+}
+
+.other-account-card .account-balance.negative {
+  color: var(--danger);
+}
+
+.other-account-card .account-date {
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  margin-top: 4px;
+}
+
 /* Total (virtual) account card */
+.virtual-card {
+  grid-column: span 2;
+}
+
+.virtual-card-content {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 1fr);
+  align-items: center;
+  gap: 16px;
+}
+
+.account-card-summary {
+  min-width: 0;
+}
+
+.virtual-composition {
+  min-width: 0;
+  padding-left: 16px;
+  border-left: 1px solid rgba(107, 114, 128, 0.25);
+}
+
+.virtual-composition-title {
+  margin-bottom: 4px;
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.virtual-composition-body {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.virtual-pie {
+  flex: 0 0 116px;
+}
+
+.virtual-composition-legend {
+  flex: 1;
+  min-width: 0;
+  list-style: none;
+}
+
+.virtual-composition-legend li {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.72rem;
+  line-height: 1.6;
+}
+
+.virtual-legend-swatch {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.virtual-legend-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.virtual-legend-percentage {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.virtual-composition-empty {
+  padding: 34px 0;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
 .total-card {
   border: 2px solid #059669;
   background: linear-gradient(135deg, #d1fae5 0%, #ffffff 100%);
@@ -430,10 +544,32 @@ body {
 
 /* Chart area */
 .chart-container {
+  position: relative;
   margin-top: 20px;
   padding: 16px;
   background: var(--card-bg);
   border-radius: var(--radius);
+}
+
+.chart-hover-tooltip {
+  position: absolute;
+  z-index: 1;
+  top: 62px;
+  right: 28px;
+  display: flex;
+  flex-direction: column;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+  pointer-events: none;
+  font-size: 0.75rem;
+  line-height: 1.35;
+}
+
+.chart-hover-tooltip span {
+  color: var(--text-secondary);
 }
 
 .chart-header {
@@ -837,6 +973,21 @@ body {
 }
 
 @media (max-width: 600px) {
+  .virtual-card {
+    grid-column: span 1;
+  }
+
+  .virtual-card-content {
+    grid-template-columns: 1fr;
+  }
+
+  .virtual-composition {
+    padding-top: 12px;
+    padding-left: 0;
+    border-top: 1px solid rgba(107, 114, 128, 0.25);
+    border-left: 0;
+  }
+
   .repayment-form-grid,
   .repayment-readonly-grid {
     grid-template-columns: 1fr;

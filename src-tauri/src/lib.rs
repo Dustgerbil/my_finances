@@ -1088,7 +1088,7 @@ async fn fetch_fresh_akahu_accounts(
     app_id: &str,
     user_token: &str,
     timeout_secs: u64,
-) -> Result<Vec<AkahuAccount>, String> {
+) -> Result<(Vec<AkahuAccount>, bool), String> {
     let started = std::time::Instant::now();
     let maximum_age = Duration::minutes(MAX_ACCEPTABLE_BALANCE_AGE_MINUTES);
 
@@ -1096,14 +1096,11 @@ async fn fetch_fresh_akahu_accounts(
         let accounts = fetch_akahu_accounts(app_id, user_token).await?;
         let issues = balance_freshness_issues(&accounts, Utc::now(), maximum_age);
         if issues.is_empty() {
-            return Ok(accounts);
+            return Ok((accounts, false));
         }
 
         if started.elapsed().as_secs() >= timeout_secs {
-            return Err(format!(
-                "Akahu refresh completed, but current balances were not ready for: {}. No data was saved; try Refresh now again.",
-                issues.join(", ")
-            ));
+            return Ok((accounts, true));
         }
 
         tokio::time::sleep(std::time::Duration::from_secs(ACCOUNT_FRESHNESS_POLL_SECS)).await;
@@ -1170,11 +1167,11 @@ async fn fetch_akahu_balances(state: State<'_, AppState>, force: bool) -> Result
     // account has a recent source balance timestamp. A Personal App's manual
     // refresh rest period is one hour; the extra five minutes avoids rejecting
     // a just-within-window result due to clock or request latency. If freshness
-    // cannot be verified, return before writing values or today's fetch marker
-    // so the user can retry. When the refresh job itself timed out, skip this
-    // second wait and save whatever account data is already available instead.
-    let accounts = if refresh_timed_out {
-        fetch_akahu_accounts(&app_id, &user_token).await?
+    // cannot be verified before the timeout, save the most recent account
+    // response instead of failing the fetch. When the refresh job itself timed
+    // out, skip this second wait and fetch whatever data is available once.
+    let (accounts, freshness_timed_out) = if refresh_timed_out {
+        (fetch_akahu_accounts(&app_id, &user_token).await?, false)
     } else {
         fetch_fresh_akahu_accounts(&app_id, &user_token, ACCOUNT_FRESHNESS_TIMEOUT_SECS).await?
     };
@@ -1255,17 +1252,28 @@ async fn fetch_akahu_balances(state: State<'_, AppState>, force: bool) -> Result
             "Akahu refresh timed out; fetched {} NZD accounts from available data",
             nzd_accounts.len()
         ))
+    } else if freshness_timed_out {
+        Ok(format!(
+            "Akahu balance freshness check timed out; fetched {} NZD accounts from available data",
+            nzd_accounts.len()
+        ))
     } else {
         Ok(format!("Fetched {} NZD accounts", nzd_accounts.len()))
     }
 }
 
-#[tauri::command]
-fn get_accounts_summary(state: State<'_, AppState>) -> Result<Vec<AccountSummary>, String> {
-    with_db_ro(&state, |db| {
-        let mut stmt = db
-            .prepare(
-                "SELECT a.id, a.name, a.type, a.institution, a.currency, a.is_manual, a.is_ignored,
+fn query_accounts_summary(
+    db: &Connection,
+    ignored_only: bool,
+) -> Result<Vec<AccountSummary>, String> {
+    let visibility_filter = if ignored_only {
+        "a.is_ignored = 1
+         AND a.id NOT IN ('__total__', '__assets_total__', '__liabilities_total__')"
+    } else {
+        "a.is_ignored = 0"
+    };
+    let query = format!(
+        "SELECT a.id, a.name, a.type, a.institution, a.currency, a.is_manual, a.is_ignored,
                         a.interest_rate, a.repayment_amount, a.repayment_frequency,
                         a.repayment_frequency_unit, a.rate_expiry, a.initial_next_repayment_date,
                         av.balance, av.recorded_date,
@@ -1287,45 +1295,54 @@ fn get_accounts_summary(state: State<'_, AppState>) -> Result<Vec<AccountSummary
                      )
                      WHERE rn = 1
                  ) av ON a.id = av.account_id
-                 WHERE a.is_ignored = 0
+                 WHERE {visibility_filter}
                  ORDER BY CASE WHEN a.id = '__total__' THEN 0
                                WHEN a.id = '__assets_total__' THEN 1
                                WHEN a.id = '__liabilities_total__' THEN 2
                                ELSE 3 END,
-                          a.institution, a.name",
-            )
-            .map_err(|e| e.to_string())?;
+                          a.institution, a.name"
+    );
+    let mut stmt = db.prepare(&query).map_err(|e| e.to_string())?;
 
-        let summaries = stmt
-            .query_map([], |row| {
-                Ok(AccountSummary {
-                    account: Account {
-                        id: row.get(0)?,
-                        name: row.get(1)?,
-                        account_type: row.get(2)?,
-                        institution: row.get(3)?,
-                        currency: row.get(4)?,
-                        is_manual: row.get::<_, i32>(5)? != 0,
-                        is_ignored: row.get::<_, i32>(6)? != 0,
-                        interest_rate: row.get(7)?,
-                        repayment_amount: row.get(8)?,
-                        repayment_frequency: row.get(9)?,
-                        repayment_frequency_unit: row.get(10)?,
-                        rate_expiry: row.get(11)?,
-                        initial_next_repayment_date: row.get(12)?,
-                    },
-                    latest_balance: row.get(13)?,
-                    latest_date: row.get(14)?,
-                    max_balance: row.get(15)?,
-                    previous_balance: row.get(16)?,
-                })
+    let summaries = stmt
+        .query_map([], |row| {
+            Ok(AccountSummary {
+                account: Account {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    account_type: row.get(2)?,
+                    institution: row.get(3)?,
+                    currency: row.get(4)?,
+                    is_manual: row.get::<_, i32>(5)? != 0,
+                    is_ignored: row.get::<_, i32>(6)? != 0,
+                    interest_rate: row.get(7)?,
+                    repayment_amount: row.get(8)?,
+                    repayment_frequency: row.get(9)?,
+                    repayment_frequency_unit: row.get(10)?,
+                    rate_expiry: row.get(11)?,
+                    initial_next_repayment_date: row.get(12)?,
+                },
+                latest_balance: row.get(13)?,
+                latest_date: row.get(14)?,
+                max_balance: row.get(15)?,
+                previous_balance: row.get(16)?,
             })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
 
-        Ok(summaries)
-    })
+    Ok(summaries)
+}
+
+#[tauri::command]
+fn get_accounts_summary(state: State<'_, AppState>) -> Result<Vec<AccountSummary>, String> {
+    with_db_ro(&state, |db| query_accounts_summary(db, false))
+}
+
+#[tauri::command]
+fn get_other_accounts_summary(state: State<'_, AppState>) -> Result<Vec<AccountSummary>, String> {
+    with_db_ro(&state, |db| query_accounts_summary(db, true))
 }
 
 #[tauri::command]
@@ -2657,6 +2674,30 @@ mod tests {
     }
 
     #[test]
+    fn other_accounts_summary_returns_only_ignored_real_accounts() {
+        let conn = test_db();
+        conn.execute_batch(
+            "INSERT INTO accounts
+                (id, name, type, institution, currency, is_manual, is_ignored)
+             VALUES ('ignored-1', 'Archived Savings', 'SAVINGS', 'Test Bank', 'NZD', 0, 1);
+             INSERT INTO account_values (account_id, balance, recorded_date)
+             VALUES
+                ('ignored-1', 100, '2026-08-20'),
+                ('ignored-1', 125, '2026-08-21');
+             UPDATE accounts SET is_ignored = 1 WHERE id = '__total__';",
+        )
+        .unwrap();
+
+        let summaries = query_accounts_summary(&conn, true).unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].account.id, "ignored-1");
+        assert_eq!(summaries[0].latest_balance, Some(125.0));
+        assert_eq!(summaries[0].previous_balance, Some(100.0));
+        assert_eq!(summaries[0].latest_date.as_deref(), Some("2026-08-21"));
+    }
+
+    #[test]
     fn liability_schema_migration_adds_nullable_fields_to_existing_accounts_table() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -3173,6 +3214,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             fetch_akahu_balances,
             get_accounts_summary,
+            get_other_accounts_summary,
             get_account_history,
             get_account_changes,
             get_all_accounts_config,

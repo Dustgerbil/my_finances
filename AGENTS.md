@@ -175,6 +175,7 @@ graphs zig-zag vertically and look "stale". (See history fix, 2026-06-18.)
 |---|---|
 | `fetch_akahu_balances` | Trigger Akahu refresh, fetch accounts, store NZD-only, recompute totals. `force=false` is once/day; `force=true` replaces today's snapshot. |
 | `get_accounts_summary` | Cards data, incl. virtual accounts (`id LIKE '__'`). |
+| `get_other_accounts_summary` | Latest values for ignored real accounts only; excludes all virtual totals. |
 | `get_account_history` | Per-account values for the line chart. |
 | `get_account_changes` | 30d/180d/360d/all-time change chips (lookback by recorded_date). |
 | `get_all_accounts_config` | All real accounts (excl. virtual) for config screen. |
@@ -203,19 +204,23 @@ graphs zig-zag vertically and look "stale". (See history fix, 2026-06-18.)
   `force=true` to replace today's snapshot with current Akahu data. After the
   Akahu refresh job completes, the backend polls `/v1/accounts` until each
   refreshable NZD account's `refreshed.balance` timestamp is no more than 65
-  minutes old. If freshness cannot be verified within 30 seconds, it writes no
-  account values or daily fetch marker, so the request can be retried. If the
-  refresh job itself does not finish within 120 seconds, the app stops waiting,
-  fetches the account data Akahu currently has available, and identifies that
-  fallback in the success message.
-- **Max-balance ⭐ badge:** shown on a card when `latest_balance == max_balance`.
+  minutes old. If freshness cannot be verified within 30 seconds, it saves the
+  most recent account response instead of failing. If the refresh job itself
+  does not finish within 120 seconds, the app stops waiting, fetches the account
+  data Akahu currently has available, and identifies either fallback in the
+  success message.
+- **Max-balance ⭐ badge:** shown after the balance direction indicator on
+  Dashboard cards and Account Detail's Current Value when the latest balance
+  equals the all-time maximum. When no direction is shown, it sits directly
+  after the balance.
 - **Balance direction:** Dashboard balances and Account Detail's Current Value
   compare the newest stored value with the immediately preceding stored value:
-  up arrow for higher, down arrow for lower, and a bar for unchanged. With fewer
-  than two values, no direction is shown. Same-day refreshes replace today's
-  value, so the comparison remains against the previous saved day.
-- **Ignore:** ignored accounts are hidden from the dashboard *and* excluded from
-  virtual total sums.
+  up arrow for higher and down arrow for lower. Unchanged values and accounts
+  with fewer than two values show no direction. Same-day refreshes replace
+  today's value, so the comparison remains against the previous saved day.
+- **Ignore:** ignored accounts are hidden from the dashboard and excluded from
+  virtual total sums, but remain visible with their latest values on the
+  read-only Other Accounts screen.
 - **Changes lookback:** `get_account_changes` returns `None` for a fixed period
   when the account's earliest recorded_date is after the lookback date (not
   enough history yet). The all-time change compares the latest balance with the

@@ -7,16 +7,14 @@ export default function BalanceDirection({
   current,
   previous,
 }: BalanceDirectionProps) {
-  if (current == null || previous == null) return null;
+  if (current == null || previous == null || current === previous) return null;
 
-  const direction = current > previous ? "up" : current < previous ? "down" : "flat";
-  const symbol = direction === "up" ? "↑" : direction === "down" ? "↓" : "—";
+  const direction = current > previous ? "up" : "down";
+  const symbol = direction === "up" ? "↑" : "↓";
   const label =
     direction === "up"
       ? "Increased since the previous saved value"
-      : direction === "down"
-        ? "Decreased since the previous saved value"
-        : "Unchanged since the previous saved value";
+      : "Decreased since the previous saved value";
 
   return (
     <span

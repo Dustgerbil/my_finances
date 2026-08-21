@@ -2,9 +2,46 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { Cell, Pie, PieChart } from "recharts";
 import type { AccountSummary, AccountChange } from "../types";
 import { formatAccountType } from "../format";
 import BalanceDirection from "../components/BalanceDirection";
+
+const ACCOUNT_MIX_COLORS = ["#4f46e5", "#0ea5e9", "#14b8a6", "#f59e0b", "#94a3b8"];
+const MAX_NAMED_ACCOUNT_SLICES = 4;
+
+interface AccountMixSlice {
+  name: string;
+  value: number;
+  percentage: number;
+  color: string;
+}
+
+function buildAccountMix(items: AccountSummary[]): AccountMixSlice[] {
+  const balances = items
+    .flatMap((item) => {
+      const balance = item.latest_balance;
+      return balance != null && Number.isFinite(balance) && balance !== 0
+        ? [{ name: item.account.name, value: Math.abs(balance) }]
+        : [];
+    })
+    .sort((a, b) => b.value - a.value);
+
+  const total = balances.reduce((sum, item) => sum + item.value, 0);
+  if (total === 0) return [];
+
+  const visible = balances.slice(0, MAX_NAMED_ACCOUNT_SLICES);
+  const otherValue = balances
+    .slice(MAX_NAMED_ACCOUNT_SLICES)
+    .reduce((sum, item) => sum + item.value, 0);
+  if (otherValue > 0) visible.push({ name: "Other", value: otherValue });
+
+  return visible.map((item, index) => ({
+    ...item,
+    percentage: (item.value / total) * 100,
+    color: ACCOUNT_MIX_COLORS[index],
+  }));
+}
 
 export default function Dashboard() {
   const navigate = useNavigate();
@@ -152,12 +189,70 @@ export default function Dashboard() {
     (a) => !a.account.id.startsWith("__") && (a.latest_balance ?? 0) < 0
   );
 
+  const renderAccountMix = (items: AccountSummary[]) => {
+    const slices = buildAccountMix(items);
+    const chartLabel = slices.length > 0
+      ? `Largest account proportions by balance size: ${slices
+          .map((slice) => `${slice.name} ${Math.round(slice.percentage)} percent`)
+          .join(", ")}`
+      : "No account balances available for this total";
+
+    return (
+      <div className="virtual-composition">
+        <div className="virtual-composition-title">Largest accounts</div>
+        {slices.length > 0 ? (
+          <div className="virtual-composition-body" role="img" aria-label={chartLabel}>
+            <PieChart width={116} height={116} className="virtual-pie" aria-hidden="true">
+              <Pie
+                data={slices}
+                dataKey="value"
+                nameKey="name"
+                cx="50%"
+                cy="50%"
+                innerRadius={28}
+                outerRadius={54}
+                paddingAngle={1}
+                stroke="#ffffff"
+                strokeWidth={2}
+                isAnimationActive={false}
+              >
+                {slices.map((slice) => (
+                  <Cell key={slice.name} fill={slice.color} />
+                ))}
+              </Pie>
+            </PieChart>
+            <ul className="virtual-composition-legend">
+              {slices.map((slice) => (
+                <li key={slice.name} title={slice.name}>
+                  <span className="virtual-legend-swatch" style={{ backgroundColor: slice.color }} />
+                  <span className="virtual-legend-name">{slice.name}</span>
+                  <span className="virtual-legend-percentage">{Math.round(slice.percentage)}%</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : (
+          <div className="virtual-composition-empty">No balances yet</div>
+        )}
+      </div>
+    );
+  };
+
   const renderCard = (item: AccountSummary, isNegative = false) => {
     const id = item.account.id;
+    const isVirtual = id.startsWith("__");
     const isTotal = id === "__total__";
     const isSubTotal = id === "__assets_total__" || id === "__liabilities_total__";
     const isAtMax = item.latest_balance != null && item.max_balance != null && item.latest_balance === item.max_balance;
+    const mixAccounts = isTotal
+      ? [...positiveAccounts, ...negativeAccounts]
+      : id === "__assets_total__"
+      ? positiveAccounts
+      : id === "__liabilities_total__"
+      ? negativeAccounts
+      : [];
     const cls = [
+      isVirtual ? " virtual-card" : "",
       isTotal ? " total-card" : "",
       isSubTotal ? " subtotal-card" : "",
       id === "__assets_total__" ? " assets-subtotal" : "",
@@ -172,55 +267,64 @@ export default function Dashboard() {
         onClick={() => navigate(`/account/${encodeURIComponent(item.account.id)}`)}
         aria-label={`View ${item.account.name} account details`}
       >
-        <div className="account-name">
-          {item.account.name}
-          {isAtMax && <span className="alltime-high" title="All-time high"> ⭐</span>}
-          {item.account.is_manual && (
-            <span className="manual-badge">Manual</span>
-          )}
-        </div>
-        <div className="account-institution">
-          {item.account.institution}
-          {item.account.type ? ` · ${formatAccountType(item.account.type)}` : ""}
-        </div>
-        <div className="account-balance balance-with-direction">
-          <span>{formatCurrency(item.latest_balance)}</span>
-          <BalanceDirection
-            current={item.latest_balance}
-            previous={item.previous_balance}
-          />
-        </div>
-        {item.latest_date && (
-          <div className="account-date">
-            As at {formatDate(item.latest_date)}
-          </div>
-        )}
-        {changes[item.account.id] && changes[item.account.id].length > 0 && (
-          <div className="account-changes">
-            {changes[item.account.id].map((ch) => {
-              if (ch.change_amount == null) return null;
-              const symbol =
-                ch.period === "30d"
-                  ? "30d"
-                  : ch.period === "180d"
-                  ? "180d"
-                  : ch.period === "360d"
-                  ? "360d"
-                  : "All";
-              const titleLabel = ch.period === "all" ? "All time" : symbol;
-              const sign = ch.change_amount > 0 ? "+" : "";
-              return (
-                <span
-                  key={ch.period}
-                  className={`change-chip ${ch.change_amount > 0 ? "up" : ch.change_amount < 0 ? "down" : ""}`}
-                  title={`${titleLabel}: ${sign}${formatCurrency(ch.change_amount)}`}
-                >
-                  {symbol} {sign}{formatCurrency(ch.change_amount)}
+        <div className={isVirtual ? "virtual-card-content" : undefined}>
+          <div className="account-card-summary">
+            <div className="account-name">
+              {item.account.name}
+              {item.account.is_manual && (
+                <span className="manual-badge">Manual</span>
+              )}
+            </div>
+            <div className="account-institution">
+              {item.account.institution}
+              {item.account.type ? ` · ${formatAccountType(item.account.type)}` : ""}
+            </div>
+            <div className="account-balance balance-with-direction">
+              <span>{formatCurrency(item.latest_balance)}</span>
+              <BalanceDirection
+                current={item.latest_balance}
+                previous={item.previous_balance}
+              />
+              {isAtMax && (
+                <span className="alltime-high" role="img" aria-label="All-time high" title="All-time high">
+                  ⭐
                 </span>
-              );
-            })}
+              )}
+            </div>
+            {item.latest_date && (
+              <div className="account-date">
+                As at {formatDate(item.latest_date)}
+              </div>
+            )}
+            {changes[item.account.id] && changes[item.account.id].length > 0 && (
+              <div className="account-changes">
+                {changes[item.account.id].map((ch) => {
+                  if (ch.change_amount == null) return null;
+                  const symbol =
+                    ch.period === "30d"
+                      ? "30d"
+                      : ch.period === "180d"
+                      ? "180d"
+                      : ch.period === "360d"
+                      ? "360d"
+                      : "All";
+                  const titleLabel = ch.period === "all" ? "All time" : symbol;
+                  const sign = ch.change_amount > 0 ? "+" : "";
+                  return (
+                    <span
+                      key={ch.period}
+                      className={`change-chip ${ch.change_amount > 0 ? "up" : ch.change_amount < 0 ? "down" : ""}`}
+                      title={`${titleLabel}: ${sign}${formatCurrency(ch.change_amount)}`}
+                    >
+                      {symbol} {sign}{formatCurrency(ch.change_amount)}
+                    </span>
+                  );
+                })}
+              </div>
+            )}
           </div>
-        )}
+          {isVirtual && renderAccountMix(mixAccounts)}
+        </div>
       </button>
     );
   };
@@ -230,6 +334,12 @@ export default function Dashboard() {
       <div className="header">
         <h1>My Finances</h1>
         <div className="header-actions">
+          <button
+            className="btn btn-secondary"
+            onClick={() => navigate("/other-accounts")}
+          >
+            Other Accounts
+          </button>
           <button
             className="btn btn-primary"
             onClick={handleFetch}

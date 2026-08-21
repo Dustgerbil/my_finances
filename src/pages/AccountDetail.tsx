@@ -8,8 +8,8 @@ import {
   XAxis,
   YAxis,
   CartesianGrid,
-  Tooltip,
   ResponsiveContainer,
+  type DotItemDotProps,
 } from "recharts";
 import type { AccountHistory, AccountChange, DeletedValue } from "../types";
 import { formatAccountType } from "../format";
@@ -46,6 +46,7 @@ export default function AccountDetail() {
   const [error, setError] = useState<string | null>(null);
   const [changes, setChanges] = useState<AccountChange[]>([]);
   const [chartRange, setChartRange] = useState<ChartRange>("1y");
+  const [hoveredChartIndex, setHoveredChartIndex] = useState<number | null>(null);
 
   // Optional repayment details for accounts whose current balance is negative.
   const [interestRate, setInterestRate] = useState("");
@@ -295,6 +296,9 @@ export default function AccountDetail() {
       balance: v.balance,
       label: formatDate(v.recorded_date),
     }));
+  const hoveredChartPoint = hoveredChartIndex != null
+    ? chartData[hoveredChartIndex] ?? null
+    : null;
 
   return (
     <div>
@@ -306,9 +310,6 @@ export default function AccountDetail() {
         <div>
           <h1>
             {data.account.name}
-            {data.current_balance != null && data.max_balance != null && data.current_balance === data.max_balance && (
-              <span className="alltime-high" title="All-time high"> ⭐</span>
-            )}
             {data.account.is_manual && (
               <span className="manual-badge">Manual</span>
             )}
@@ -338,8 +339,17 @@ export default function AccountDetail() {
               ))}
             </div>
           </div>
+          {hoveredChartPoint && (
+            <div className="chart-hover-tooltip" role="status">
+              <strong>{formatCurrency(hoveredChartPoint.balance)}</strong>
+              <span>{hoveredChartPoint.label}</span>
+            </div>
+          )}
           <ResponsiveContainer width="100%" height={300}>
-            <LineChart data={chartData}>
+            <LineChart
+              data={chartData}
+              onMouseLeave={() => setHoveredChartIndex(null)}
+            >
               <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
               <XAxis
                 dataKey="label"
@@ -355,25 +365,30 @@ export default function AccountDetail() {
                 }}
                 tickMargin={8}
               />
-              <Tooltip
-                formatter={(value) => {
-                  const n = Number(value);
-                  const abs = Math.abs(n);
-                  const sign = n < 0 ? "-" : "";
-                  return [
-                    `${sign}$${abs.toLocaleString(undefined, {
-                      minimumFractionDigits: 2,
-                    })}`,
-                    "Balance",
-                  ];
-                }}
-              />
               <Line
                 type="monotone"
                 dataKey="balance"
                 stroke="var(--accent)"
                 strokeWidth={2}
-                dot={{ r: 3, fill: "var(--accent)" }}
+                dot={(props: DotItemDotProps) => (
+                  <g
+                    onMouseEnter={() => setHoveredChartIndex(props.index)}
+                    onMouseLeave={() => setHoveredChartIndex(null)}
+                  >
+                    <circle
+                      cx={props.cx}
+                      cy={props.cy}
+                      r={10}
+                      fill="transparent"
+                    />
+                    <circle
+                      cx={props.cx}
+                      cy={props.cy}
+                      r={3}
+                      fill="var(--accent)"
+                    />
+                  </g>
+                )}
                 activeDot={{ r: 5 }}
               />
             </LineChart>
@@ -394,6 +409,13 @@ export default function AccountDetail() {
               current={data.current_balance}
               previous={data.previous_balance}
             />
+            {data.current_balance != null &&
+              data.max_balance != null &&
+              data.current_balance === data.max_balance && (
+                <span className="alltime-high" role="img" aria-label="All-time high" title="All-time high">
+                  ⭐
+                </span>
+              )}
           </div>
         </div>
         <div className="detail-stat">
