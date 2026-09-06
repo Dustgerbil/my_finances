@@ -1797,7 +1797,13 @@ fn get_account_changes(
 
         let today = Local::now().format("%Y-%m-%d").to_string();
 
-        let periods: Vec<(&str, i64)> = vec![("30d", 30), ("180d", 180), ("360d", 360)];
+        let periods: Vec<(&str, i64)> = vec![
+            ("30d", 30),
+            ("90d", 90),
+            ("180d", 180),
+            ("270d", 270),
+            ("360d", 360),
+        ];
 
         let mut results = Vec::new();
 

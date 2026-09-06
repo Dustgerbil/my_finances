@@ -13,6 +13,10 @@ import {
 } from "recharts";
 import type { AccountHistory, AccountChange, DeletedValue } from "../types";
 import { formatAccountType } from "../format";
+import {
+  buildAdaptiveBalanceAxis,
+  formatAdaptiveAxisTick,
+} from "../chartAxis";
 import BalanceDirection from "../components/BalanceDirection";
 
 type ChartRange = "1m" | "6m" | "1y" | "all";
@@ -296,6 +300,9 @@ export default function AccountDetail() {
       balance: v.balance,
       label: formatDate(v.recorded_date),
     }));
+  const adaptiveBalanceAxis = buildAdaptiveBalanceAxis(
+    chartData.map((point) => point.balance),
+  );
   const hoveredChartPoint = hoveredChartIndex != null
     ? chartData[hoveredChartIndex] ?? null
     : null;
@@ -357,8 +364,13 @@ export default function AccountDetail() {
                 tickMargin={8}
               />
               <YAxis
+                domain={adaptiveBalanceAxis?.domain}
+                ticks={adaptiveBalanceAxis?.ticks}
                 tick={{ fontSize: 12 }}
                 tickFormatter={(v) => {
+                  if (adaptiveBalanceAxis) {
+                    return formatAdaptiveAxisTick(v, adaptiveBalanceAxis.tickStep);
+                  }
                   const abs = Math.abs(v);
                   const sign = v < 0 ? "-" : "";
                   return `${sign}$${(abs / 1000).toFixed(0)}k`;
@@ -438,45 +450,6 @@ export default function AccountDetail() {
         </div>
       </div>
 
-      {data.current_balance != null &&
-        data.current_balance < 0 &&
-        (data.account.id === "__liabilities_total__" ||
-          !data.account.id.startsWith("__")) && (
-          <div className="card liability-calculations">
-            <h3>
-              {data.account.id === "__liabilities_total__"
-                ? "Combined repayment calculations"
-                : "Repayment calculations"}
-            </h3>
-            <div className="detail-stats">
-              <div className="detail-stat">
-                <div className="stat-label">Next repayment</div>
-                <div className="stat-value">
-                  {data.next_repayment_date
-                    ? formatDate(data.next_repayment_date)
-                    : "—"}
-                </div>
-              </div>
-              <div className="detail-stat">
-                <div className="stat-label">Estimated repayment date</div>
-                <div className="stat-value">
-                  {data.estimated_repayment_date
-                    ? formatDate(data.estimated_repayment_date)
-                    : "—"}
-                </div>
-                {data.repayment_estimate_status && (
-                  <div className="stat-date">{data.repayment_estimate_status}</div>
-                )}
-              </div>
-            </div>
-            <p className="calculation-note">
-              {data.account.id === "__liabilities_total__"
-                ? "Derived from the included liability accounts. The combined payoff date is the latest individual estimate; each estimate assumes its current rate continues indefinitely and ignores rate expiry."
-                : "The estimate assumes the current interest rate continues indefinitely; the rate expiry is not used in this calculation."}
-            </p>
-          </div>
-      )}
-
       {/* Historical changes */}
       {changes.length > 0 && (
         <div className="changes-section">
@@ -486,8 +459,12 @@ export default function AccountDetail() {
               const label =
                 ch.period === "30d"
                   ? "30 days"
+                  : ch.period === "90d"
+                  ? "90 days"
                   : ch.period === "180d"
                   ? "180 days"
+                  : ch.period === "270d"
+                  ? "270 days"
                   : ch.period === "360d"
                   ? "360 days"
                   : "All time";
@@ -527,11 +504,12 @@ export default function AccountDetail() {
 
       {data.current_balance != null &&
         data.current_balance < 0 &&
-        !data.account.id.startsWith("__") && (
+        (data.account.id === "__liabilities_total__" ||
+          !data.account.id.startsWith("__")) && (
           <div className="card liability-repayment-form">
             <div className="repayment-details-header">
               <h3>Repayment details</h3>
-              {!editingRepayment && (
+              {!editingRepayment && !data.account.id.startsWith("__") && (
                 <button
                   type="button"
                   className="btn"
@@ -545,7 +523,7 @@ export default function AccountDetail() {
               )}
             </div>
 
-            {editingRepayment ? (
+            {editingRepayment && !data.account.id.startsWith("__") ? (
               <>
                 <p>All fields are optional. Complete all except rate expiry to calculate an estimate.</p>
                 <div className="repayment-form-grid">
@@ -649,27 +627,31 @@ export default function AccountDetail() {
             ) : (
               <>
                 <div className="repayment-readonly-grid">
-                  <div>
-                    <span>Annual interest rate</span>
-                    <strong>
-                      {data.account.interest_rate != null
-                        ? `${data.account.interest_rate}%`
-                        : "—"}
-                    </strong>
-                  </div>
-                  <div>
-                    <span>Repayment amount</span>
-                    <strong>{formatCurrency(data.account.repayment_amount)}</strong>
-                  </div>
-                  <div>
-                    <span>Repayment frequency</span>
-                    <strong>
-                      {data.account.repayment_frequency != null &&
-                      data.account.repayment_frequency_unit
-                        ? `${data.account.repayment_frequency} ${data.account.repayment_frequency_unit}`
-                        : "—"}
-                    </strong>
-                  </div>
+                  {!data.account.id.startsWith("__") && (
+                    <>
+                      <div>
+                        <span>Annual interest rate</span>
+                        <strong>
+                          {data.account.interest_rate != null
+                            ? `${data.account.interest_rate}%`
+                            : "—"}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>Repayment amount</span>
+                        <strong>{formatCurrency(data.account.repayment_amount)}</strong>
+                      </div>
+                      <div>
+                        <span>Repayment frequency</span>
+                        <strong>
+                          {data.account.repayment_frequency != null &&
+                          data.account.repayment_frequency_unit
+                            ? `${data.account.repayment_frequency} ${data.account.repayment_frequency_unit}`
+                            : "—"}
+                        </strong>
+                      </div>
+                    </>
+                  )}
                   <div>
                     <span>Next payment date</span>
                     <strong>
@@ -678,13 +660,26 @@ export default function AccountDetail() {
                         : "—"}
                     </strong>
                   </div>
+                  {!data.account.id.startsWith("__") && (
+                    <div>
+                      <span>Rate expiry</span>
+                      <strong>
+                        {data.account.rate_expiry
+                          ? formatDate(data.account.rate_expiry)
+                          : "—"}
+                      </strong>
+                    </div>
+                  )}
                   <div>
-                    <span>Rate expiry</span>
+                    <span>Estimated repayment date</span>
                     <strong>
-                      {data.account.rate_expiry
-                        ? formatDate(data.account.rate_expiry)
+                      {data.estimated_repayment_date
+                        ? formatDate(data.estimated_repayment_date)
                         : "—"}
                     </strong>
+                    {data.repayment_estimate_status && (
+                      <div className="stat-date">{data.repayment_estimate_status}</div>
+                    )}
                   </div>
                 </div>
                 {repaymentStatus && (
@@ -694,6 +689,11 @@ export default function AccountDetail() {
                 )}
               </>
             )}
+            <p className="calculation-note">
+              {data.account.id === "__liabilities_total__"
+                ? "Derived from the included liability accounts. The combined payoff date is the latest individual estimate; each estimate assumes its current rate continues indefinitely and ignores rate expiry."
+                : "The estimate assumes the current interest rate continues indefinitely; the rate expiry is not used in this calculation."}
+            </p>
           </div>
         )}
 

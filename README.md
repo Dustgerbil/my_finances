@@ -31,7 +31,7 @@ and never touches a third-party server.
   refresh job or balance-freshness check times out, it gracefully falls back to
   the account data Akahu has available instead of failing the whole fetch.
 - **Dashboard** — a card per account showing current balance, direction since
-  the previous saved value, and 30/180/360-day change chips, plus virtual
+  the previous saved value, and 30/90/180/270/360-day change chips, plus virtual
   "Total", "Assets & Savings", and "Liabilities" sub-total cards. The same
   direction indicator appears beside Current Value on each account page.
 - **All-time-high badge (⭐)** — a card earns a star when its latest balance

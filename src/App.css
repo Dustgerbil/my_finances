@@ -295,6 +295,68 @@ body {
   font-size: 0.8rem;
 }
 
+.grand-total-composition {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.grand-total-waterfall {
+  display: block;
+  width: 100%;
+  max-width: 340px;
+  height: 140px;
+  overflow: visible;
+}
+
+.waterfall-axis {
+  stroke: rgba(107, 114, 128, 0.5);
+  stroke-width: 1;
+}
+
+.waterfall-connector {
+  stroke: rgba(107, 114, 128, 0.65);
+  stroke-width: 1.25;
+  stroke-dasharray: 3 3;
+}
+
+.waterfall-bar {
+  stroke: rgba(255, 255, 255, 0.8);
+  stroke-width: 1;
+}
+
+.waterfall-assets {
+  fill: #059669;
+}
+
+.waterfall-liabilities {
+  fill: #dc2626;
+}
+
+.waterfall-net {
+  fill: #4f46e5;
+}
+
+.waterfall-value {
+  fill: var(--text-primary);
+  font-size: 0.7rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.waterfall-label {
+  fill: var(--text-secondary);
+  font-size: 0.68rem;
+  font-weight: 600;
+}
+
+.waterfall-equation {
+  margin-top: -4px;
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+  text-align: center;
+}
+
 .total-card {
   border: 2px solid #059669;
   background: linear-gradient(135deg, #d1fae5 0%, #ffffff 100%);
@@ -427,20 +489,14 @@ body {
   color: var(--accent);
 }
 
-.liability-calculations,
 .liability-repayment-form {
   margin-top: 20px;
   padding: 16px;
 }
 
-.liability-calculations h3,
 .liability-repayment-form h3 {
   font-size: 1rem;
   margin-bottom: 4px;
-}
-
-.liability-calculations .detail-stats {
-  margin-top: 12px;
 }
 
 .repayment-details-header {

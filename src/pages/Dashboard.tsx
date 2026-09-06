@@ -178,6 +178,15 @@ export default function Dashboard() {
     return new Date(d).toLocaleDateString();
   };
 
+  const formatCompactCurrency = (val: number) => {
+    const abs = Math.abs(val);
+    const prefix = val < 0 ? "−" : val > 0 ? "+" : "";
+    return `${prefix}$${new Intl.NumberFormat(undefined, {
+      notation: "compact",
+      maximumFractionDigits: 1,
+    }).format(abs)}`;
+  };
+
   // Split accounts: total, positive, negative, with sub-totals
   const totalAccount = accounts.find((a) => a.account.id === "__total__");
   const assetsTotal = accounts.find((a) => a.account.id === "__assets_total__");
@@ -188,6 +197,105 @@ export default function Dashboard() {
   const negativeAccounts = accounts.filter(
     (a) => !a.account.id.startsWith("__") && (a.latest_balance ?? 0) < 0
   );
+
+  const renderGrandTotalWaterfall = () => {
+    const assets = assetsTotal?.latest_balance;
+    const liabilities = liabilitiesTotal?.latest_balance;
+    const netTotal = totalAccount?.latest_balance;
+
+    if (assets == null && liabilities == null && netTotal == null) {
+      return (
+        <div className="virtual-composition">
+          <div className="virtual-composition-title">How the total is calculated</div>
+          <div className="virtual-composition-empty">No balances yet</div>
+        </div>
+      );
+    }
+
+    const assetValue = Number.isFinite(assets) ? Math.max(assets ?? 0, 0) : 0;
+    const liabilityValue = Number.isFinite(liabilities) ? Math.min(liabilities ?? 0, 0) : 0;
+    const netValue = Number.isFinite(netTotal)
+      ? netTotal ?? 0
+      : assetValue + liabilityValue;
+    const maximumValue = Math.max(0, assetValue, netValue);
+    const minimumValue = Math.min(0, netValue);
+    const valueRange = maximumValue - minimumValue || 1;
+    const plotTop = 24;
+    const plotBottom = 104;
+    const yForValue = (value: number) =>
+      plotTop + ((maximumValue - value) / valueRange) * (plotBottom - plotTop);
+    const zeroY = yForValue(0);
+    const assetY = yForValue(assetValue);
+    const netY = yForValue(netValue);
+    const barHeight = (from: number, to: number) => Math.max(Math.abs(to - from), 2);
+    const chartLabel = `Assets ${formatCurrency(assetValue)}, liabilities ${formatCurrency(
+      liabilityValue
+    )}, net total ${formatCurrency(netValue)}`;
+
+    return (
+      <div className="virtual-composition grand-total-composition">
+        <div className="virtual-composition-title">How the total is calculated</div>
+        <svg
+          className="grand-total-waterfall"
+          viewBox="0 0 300 140"
+          role="img"
+          aria-label={chartLabel}
+        >
+          <line className="waterfall-axis" x1="8" y1={zeroY} x2="292" y2={zeroY} />
+
+          <rect
+            className="waterfall-bar waterfall-assets"
+            x="18"
+            y={Math.min(assetY, zeroY)}
+            width="64"
+            height={barHeight(assetY, zeroY)}
+            rx="5"
+          />
+          <text className="waterfall-value" x="50" y="14" textAnchor="middle">
+            {formatCompactCurrency(assetValue)}
+          </text>
+          <text className="waterfall-label" x="50" y="126" textAnchor="middle">
+            Assets
+          </text>
+
+          <line className="waterfall-connector" x1="82" y1={assetY} x2="118" y2={assetY} />
+          <rect
+            className="waterfall-bar waterfall-liabilities"
+            x="118"
+            y={Math.min(assetY, netY)}
+            width="64"
+            height={barHeight(assetY, netY)}
+            rx="5"
+          />
+          <text className="waterfall-value" x="150" y="14" textAnchor="middle">
+            {formatCompactCurrency(liabilityValue)}
+          </text>
+          <text className="waterfall-label" x="150" y="126" textAnchor="middle">
+            Liabilities
+          </text>
+
+          <line className="waterfall-connector" x1="182" y1={netY} x2="218" y2={netY} />
+          <rect
+            className="waterfall-bar waterfall-net"
+            x="218"
+            y={Math.min(netY, zeroY)}
+            width="64"
+            height={barHeight(netY, zeroY)}
+            rx="5"
+          />
+          <text className="waterfall-value" x="250" y="14" textAnchor="middle">
+            {formatCompactCurrency(netValue)}
+          </text>
+          <text className="waterfall-label" x="250" y="126" textAnchor="middle">
+            Net total
+          </text>
+        </svg>
+        <div className="waterfall-equation" aria-hidden="true">
+          Assets − liabilities = Grand Total
+        </div>
+      </div>
+    );
+  };
 
   const renderAccountMix = (items: AccountSummary[]) => {
     const slices = buildAccountMix(items);
@@ -244,9 +352,7 @@ export default function Dashboard() {
     const isTotal = id === "__total__";
     const isSubTotal = id === "__assets_total__" || id === "__liabilities_total__";
     const isAtMax = item.latest_balance != null && item.max_balance != null && item.latest_balance === item.max_balance;
-    const mixAccounts = isTotal
-      ? [...positiveAccounts, ...negativeAccounts]
-      : id === "__assets_total__"
+    const mixAccounts = id === "__assets_total__"
       ? positiveAccounts
       : id === "__liabilities_total__"
       ? negativeAccounts
@@ -303,8 +409,12 @@ export default function Dashboard() {
                   const symbol =
                     ch.period === "30d"
                       ? "30d"
+                      : ch.period === "90d"
+                      ? "90d"
                       : ch.period === "180d"
                       ? "180d"
+                      : ch.period === "270d"
+                      ? "270d"
                       : ch.period === "360d"
                       ? "360d"
                       : "All";
@@ -323,7 +433,9 @@ export default function Dashboard() {
               </div>
             )}
           </div>
-          {isVirtual && renderAccountMix(mixAccounts)}
+          {isTotal
+            ? renderGrandTotalWaterfall()
+            : isVirtual && renderAccountMix(mixAccounts)}
         </div>
       </button>
     );

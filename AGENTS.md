@@ -177,7 +177,7 @@ graphs zig-zag vertically and look "stale". (See history fix, 2026-06-18.)
 | `get_accounts_summary` | Cards data, incl. virtual accounts (`id LIKE '__'`). |
 | `get_other_accounts_summary` | Latest values for ignored real accounts only; excludes all virtual totals. |
 | `get_account_history` | Per-account values for the line chart. |
-| `get_account_changes` | 30d/180d/360d/all-time change chips (lookback by recorded_date). |
+| `get_account_changes` | 30d/90d/180d/270d/360d/all-time change chips (lookback by recorded_date). |
 | `get_all_accounts_config` | All real accounts (excl. virtual) for config screen. |
 | `toggle_ignore_account` | Flip `is_ignored`; recomputes totals. Virtual accounts rejected. |
 | `update_liability_repayment` | Store optional repayment terms for an account whose latest balance is negative. |
