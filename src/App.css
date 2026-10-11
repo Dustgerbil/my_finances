@@ -450,6 +450,27 @@ body {
   color: #991b1b;
 }
 
+.rate-expiry-notice {
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fcd34d;
+}
+
+.rate-expiry-notice ul {
+  margin: 6px 0 0;
+  padding-left: 20px;
+}
+
+.rate-expiry-notice li + li {
+  margin-top: 4px;
+}
+
+.rate-expiry-notice a {
+  color: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+}
+
 /* Account Detail */
 .detail-card {
   margin-top: 16px;
@@ -461,6 +482,32 @@ body {
   margin-top: 20px;
   flex-wrap: wrap;
 }
+
+.asset-liabilities {
+  margin-top: 24px;
+  padding: 20px;
+}
+
+.asset-liabilities h3 { margin: 0; }
+.linked-liabilities-list, .liability-options {
+  padding: 0;
+  margin: 16px 0 0;
+  border: 0;
+  min-width: 0;
+  list-style: none;
+}
+.liability-link-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+.liability-link-row input { width: 18px; height: 18px; flex-shrink: 0; }
+.liability-link-name { display: flex; flex: 1; flex-direction: column; min-width: 0; overflow-wrap: anywhere; }
+.liability-link-name small { color: var(--text-secondary); margin-top: 4px; }
+.liability-link-balance { font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.asset-link-actions { display: flex; gap: 8px; margin-top: 16px; }
 
 .detail-stat {
   flex: 1;
@@ -1052,4 +1099,63 @@ body {
   .data-health-grid {
     grid-template-columns: 1fr;
   }
+}
+
+.account-card-container {
+  display: flex;
+  flex-direction: column;
+}
+
+.account-card-container > .account-card {
+  flex: 1;
+}
+
+.retirement-control {
+  padding: 10px 16px;
+}
+
+.retirement-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.toggle input:focus-visible + .slider {
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.toggle input:disabled + .slider {
+  opacity: 0.5;
+}
+
+.retirement-details {
+  margin-bottom: 24px;
+}
+
+.retirement-details .retirement-control {
+  padding: 0;
+}
+
+.retirement-details p {
+  margin-top: 8px;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+
+/* Sync status is independent of financial data freshness. */
+.sync-panel, .sync-desktop { margin: 16px; padding: 16px; background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius); }
+.sync-panel { margin-top: max(16px, env(safe-area-inset-top)); }
+.sync-panel p, .sync-desktop p { margin-top: 8px; overflow-wrap: anywhere; }
+.sync-times { font-size: .8rem; color: var(--text-secondary); }
+.sync-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.sync-desktop { margin: 16px 0; font-size: .85rem; }
+.sync-desktop summary { cursor: pointer; }
+@media (max-width: 600px) {
+  .header { align-items: flex-start; flex-direction: column; gap: 12px; }
+  .header-actions { flex-wrap: wrap; }
+  .btn { min-height: 44px; }
+  .app { padding-bottom: max(24px, env(safe-area-inset-bottom)); }
 }

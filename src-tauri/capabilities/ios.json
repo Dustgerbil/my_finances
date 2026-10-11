@@ -1,0 +1,13 @@
+{
+  "identifier": "ios-reader",
+  "description": "Read-only iOS window: events only; financial queries and sync are app commands.",
+  "platforms": [
+    "iOS"
+  ],
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default"
+  ]
+}

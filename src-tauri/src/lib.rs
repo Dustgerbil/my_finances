@@ -2,6 +2,7 @@ use chrono::{DateTime, Datelike, Duration, Local, Months, NaiveDate, Utc};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+#[cfg(not(target_os = "ios"))]
 use notify::Watcher;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, State};
+#[cfg(not(target_os = "ios"))]
 use tauri_plugin_opener::OpenerExt;
 
 // ---------------------------------------------------------------------------
@@ -31,6 +33,7 @@ struct AppState {
     /// Filesystem watcher on the DB path. Kept in state so it lives for the
     /// app's lifetime; dropping it would stop watching for remote iCloud
     /// updates.
+    #[cfg(not(target_os = "ios"))]
     watcher: Mutex<notify::RecommendedWatcher>,
 }
 
@@ -66,6 +69,7 @@ pub struct AccountValue {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AccountSummary {
+    pub is_retired: bool,
     pub account: Account,
     pub latest_balance: Option<f64>,
     pub previous_balance: Option<f64>,
@@ -75,6 +79,8 @@ pub struct AccountSummary {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AccountHistory {
+    pub asset_financing: Option<AssetFinancing>,
+    pub is_retired: bool,
     pub account: Account,
     pub values: Vec<AccountValue>,
     pub current_balance: Option<f64>,
@@ -86,6 +92,25 @@ pub struct AccountHistory {
     pub next_repayment_date: Option<String>,
     pub estimated_repayment_date: Option<String>,
     pub repayment_estimate_status: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FinancingLiability {
+    pub id: String,
+    pub name: String,
+    pub balance: Option<f64>,
+    pub recorded_date: Option<String>,
+    pub is_retired: bool,
+    pub is_ignored: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AssetFinancing {
+    pub linked_liabilities: Vec<FinancingLiability>,
+    pub available_liabilities: Vec<FinancingLiability>,
+    pub total_debt: Option<f64>,
+    pub equity_amount: Option<f64>,
+    pub equity_percent: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -705,6 +730,9 @@ fn merge_one_conflict(
 /// connection each call — callers must drop it to release the file handle so
 /// iCloud can sync.
 fn open_db_rw(path: &std::path::Path) -> Result<Connection, String> {
+    if cfg!(target_os = "ios") {
+        return Err("This iPhone app is read-only".into());
+    }
     let conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
     init_db(&conn);
     // Merge runs on the open RW connection (it writes). Skipped if no conflicts
@@ -1281,7 +1309,8 @@ fn query_accounts_summary(
                         (SELECT balance FROM account_values
                          WHERE account_id = a.id
                          ORDER BY recorded_date DESC, id DESC
-                         LIMIT 1 OFFSET 1) AS previous_balance
+                         LIMIT 1 OFFSET 1) AS previous_balance,
+                        EXISTS(SELECT 1 FROM settings WHERE key = 'retired_account:' || a.id AND value = 'true')
                  FROM accounts a
                  LEFT JOIN (
                      SELECT account_id, balance, recorded_date
@@ -1326,6 +1355,7 @@ fn query_accounts_summary(
                 latest_date: row.get(14)?,
                 max_balance: row.get(15)?,
                 previous_balance: row.get(16)?,
+                is_retired: row.get(17)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -1343,6 +1373,204 @@ fn get_accounts_summary(state: State<'_, AppState>) -> Result<Vec<AccountSummary
 #[tauri::command]
 fn get_other_accounts_summary(state: State<'_, AppState>) -> Result<Vec<AccountSummary>, String> {
     with_db_ro(&state, |db| query_accounts_summary(db, true))
+}
+
+// Retirement is a visibility preference, independent of balance history and totals.
+fn set_account_retired_in_db(
+    db: &Connection,
+    account_id: &str,
+    retired: bool,
+) -> Result<(), String> {
+    if account_id.starts_with("__") {
+        return Err("Cannot retire virtual accounts".to_string());
+    }
+    let ignored: bool = db
+        .query_row(
+            "SELECT is_ignored != 0 FROM accounts WHERE id = ?1",
+            [account_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if ignored {
+        return Err("Include this account on the home screen before retiring it".to_string());
+    }
+    db.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+        rusqlite::params![
+            format!("retired_account:{account_id}"),
+            if retired { "true" } else { "false" }
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_account_retired(
+    state: State<'_, AppState>,
+    account_id: String,
+    retired: bool,
+) -> Result<(), String> {
+    with_db_rw(&state, |db| {
+        set_account_retired_in_db(db, &account_id, retired)
+    })
+}
+
+// Each liability has one assignment. Empty values are unlink tombstones so a
+// keep-live settings merge cannot resurrect a removed link from a conflict copy.
+fn liability_asset_links(
+    db: &Connection,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut stmt = db.prepare("SELECT substr(key, 17), value FROM settings WHERE key GLOB 'liability_asset:*' AND value != ''")
+        .map_err(|e| e.to_string())?;
+    let links = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(links)
+}
+
+fn query_asset_financing(
+    db: &Connection,
+    asset_id: &str,
+    asset_balance: Option<f64>,
+) -> Result<Option<AssetFinancing>, String> {
+    if asset_id.starts_with("__") {
+        return Ok(None);
+    }
+    let links = liability_asset_links(db)?;
+    let has_links = links.values().any(|id| id == asset_id);
+    // Keep existing links accessible even if a valuation is deleted or goes negative.
+    if !has_links && !asset_balance.is_some_and(|v| v.is_finite() && v >= 0.0) {
+        return Ok(None);
+    }
+    if links.contains_key(asset_id) {
+        return Ok(None);
+    }
+    let mut accounts = query_accounts_summary(db, false)?;
+    accounts.extend(query_accounts_summary(db, true)?);
+    let mut linked_liabilities = Vec::new();
+    let mut available_liabilities = Vec::new();
+    for item in accounts {
+        let id = &item.account.id;
+        if id == asset_id || id.starts_with("__") {
+            continue;
+        }
+        let linked = links.get(id).is_some_and(|owner| owner == asset_id);
+        let available = asset_balance.is_some_and(|v| v.is_finite() && v >= 0.0)
+            && !links.contains_key(id)
+            && !links.values().any(|owner| owner == id)
+            && item
+                .latest_balance
+                .is_some_and(|v| v.is_finite() && v < 0.0)
+            && item.account.currency == "NZD";
+        if linked || available {
+            let liability = FinancingLiability {
+                id: item.account.id,
+                name: item.account.name,
+                balance: item.latest_balance,
+                recorded_date: item.latest_date,
+                is_retired: item.is_retired,
+                is_ignored: item.account.is_ignored,
+            };
+            if linked {
+                linked_liabilities.push(liability);
+            } else {
+                available_liabilities.push(liability);
+            }
+        }
+    }
+    linked_liabilities.sort_by(|a, b| a.name.cmp(&b.name));
+    available_liabilities.sort_by(|a, b| a.name.cmp(&b.name));
+    let expected_count = links.values().filter(|id| id.as_str() == asset_id).count();
+    let total_debt = if linked_liabilities.is_empty() || linked_liabilities.len() != expected_count
+    {
+        None
+    } else {
+        linked_liabilities.iter().try_fold(0.0_f64, |total, item| {
+            item.balance.filter(|v| v.is_finite()).and_then(|v| {
+                let sum = total + (-v).max(0.0);
+                sum.is_finite().then_some(sum)
+            })
+        })
+    };
+    let equity_amount = asset_balance
+        .zip(total_debt)
+        .map(|(value, debt)| value - debt)
+        .filter(|v| v.is_finite());
+    let equity_percent = asset_balance
+        .filter(|v| *v > 0.0)
+        .zip(equity_amount)
+        .map(|(value, equity)| equity / value * 100.0)
+        .filter(|v| v.is_finite());
+    Ok(Some(AssetFinancing {
+        linked_liabilities,
+        available_liabilities,
+        total_debt,
+        equity_amount,
+        equity_percent,
+    }))
+}
+
+fn set_asset_liabilities_in_db(
+    db: &Connection,
+    asset_id: &str,
+    liability_ids: &[String],
+) -> Result<(), String> {
+    // Validate and replace as one transaction: a bad selection cannot partly unlink an asset.
+    let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
+    let (currency, balance): (String, Option<f64>) = tx.query_row(
+        "SELECT currency, (SELECT balance FROM account_values WHERE account_id = accounts.id ORDER BY recorded_date DESC, id DESC LIMIT 1) FROM accounts WHERE id = ?1",
+        [asset_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(|e| format!("Asset not found: {e}"))?;
+    if currency != "NZD" {
+        return Err("Only NZD assets can have linked liabilities".into());
+    }
+    let financing = query_asset_financing(&tx, asset_id, balance)?
+        .ok_or("Choose a real asset with a non-negative recorded value")?;
+    let mut unique = std::collections::HashSet::new();
+    for id in liability_ids {
+        if !unique.insert(id) {
+            return Err("A liability can only be selected once".into());
+        }
+        let retained = financing
+            .linked_liabilities
+            .iter()
+            .any(|item| &item.id == id);
+        let available = balance.is_some_and(|v| v.is_finite() && v >= 0.0)
+            && financing
+                .available_liabilities
+                .iter()
+                .any(|item| &item.id == id);
+        if !retained && !available {
+            return Err("A selected liability is unavailable or already linked to another asset. Reload and try again.".into());
+        }
+    }
+    tx.execute(
+        "UPDATE settings SET value = '' WHERE key GLOB 'liability_asset:*' AND value = ?1",
+        [asset_id],
+    )
+    .map_err(|e| e.to_string())?;
+    for id in liability_ids {
+        tx.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            rusqlite::params![format!("liability_asset:{id}"), asset_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_asset_liabilities(
+    state: State<'_, AppState>,
+    asset_id: String,
+    liability_ids: Vec<String>,
+) -> Result<(), String> {
+    with_db_rw(&state, |db| {
+        set_asset_liabilities_in_db(db, &asset_id, &liability_ids)
+    })
 }
 
 #[tauri::command]
@@ -1443,7 +1671,18 @@ fn get_account_history(
                 calculate_repayment_dates(&account, current_balance, Local::now().date_naive())
             };
 
+        let is_retired = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM settings WHERE key = ?1 AND value = 'true')",
+                [format!("retired_account:{}", account.id)],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+
+        let asset_financing = query_asset_financing(db, &account.id, current_balance)?;
         Ok(AccountHistory {
+            asset_financing,
+            is_retired,
             account,
             values,
             current_balance,
@@ -1516,6 +1755,16 @@ fn toggle_ignore_account(state: State<'_, AppState>, account_id: String) -> Resu
     let today = Local::now().format("%Y-%m-%d").to_string();
     let new_value = with_db_rw(&state, |db| {
         let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
+        let retired: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM settings WHERE key = ?1 AND value = 'true')",
+                [format!("retired_account:{account_id}")],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if retired {
+            return Err("Restore this retired account before excluding it from totals".to_string());
+        }
         // Toggle the is_ignored flag
         tx.execute(
             "UPDATE accounts SET is_ignored = CASE WHEN is_ignored = 0 THEN 1 ELSE 0 END
@@ -2463,6 +2712,7 @@ fn maybe_backup_on_launch(state: State<'_, AppState>) -> Result<bool, String> {
 }
 
 /// Open the backups folder in Finder using the already-present opener plugin.
+#[cfg(not(target_os = "ios"))]
 #[tauri::command]
 fn open_backups_folder(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<(), String> {
     let dir = resolve_backups_dir(&state);
@@ -2677,6 +2927,222 @@ mod tests {
             rate_expiry: Some("2026-12-31".into()),
             initial_next_repayment_date: next_date.map(str::to_string),
         }
+    }
+
+    fn equity_db() -> Connection {
+        let db = test_db();
+        db.execute_batch(
+            "INSERT INTO accounts (id, name, currency) VALUES
+            ('house', 'House', 'NZD'), ('other-house', 'Other house', 'NZD'),
+            ('mortgage-a', 'Mortgage A', 'NZD'), ('mortgage-b', 'Mortgage B', 'NZD'),
+            ('no-value', 'No value', 'NZD'), ('foreign-loan', 'Foreign loan', 'USD');
+            INSERT INTO account_values (account_id, balance, recorded_date) VALUES
+            ('house', 1000000, '2026-10-10'), ('other-house', 800000, '2026-10-10'),
+            ('mortgage-a', -500000, '2026-10-10'), ('mortgage-b', -100000, '2026-10-10'),
+            ('foreign-loan', -5000, '2026-10-10'),
+            ('mortgage-a', -700000, '2026-09-01');",
+        )
+        .unwrap();
+        db
+    }
+
+    fn link_mortgages(db: &Connection) {
+        set_asset_liabilities_in_db(db, "house", &["mortgage-a".into(), "mortgage-b".into()])
+            .unwrap();
+    }
+
+    #[test]
+    fn equity_combines_latest_debts_without_changing_values_or_totals() {
+        let db = equity_db();
+        recompute_total(&db, "2026-10-10").unwrap();
+        let before = serde_json::to_value(query_accounts_summary(&db, false).unwrap()).unwrap();
+        link_mortgages(&db);
+        let equity = query_asset_financing(&db, "house", Some(1000000.0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(equity.linked_liabilities.len(), 2);
+        assert_eq!(equity.total_debt, Some(600000.0));
+        assert_eq!(equity.equity_amount, Some(400000.0));
+        assert_eq!(equity.equity_percent, Some(40.0));
+        assert_eq!(
+            equity.linked_liabilities[0].recorded_date.as_deref(),
+            Some("2026-10-10")
+        );
+        assert_eq!(
+            before,
+            serde_json::to_value(query_accounts_summary(&db, false).unwrap()).unwrap()
+        );
+        assert!(query_asset_financing(&db, "__total__", Some(100.0))
+            .unwrap()
+            .is_none());
+        assert!(query_asset_financing(&db, "mortgage-a", Some(-500000.0))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn equity_supports_negative_zero_and_missing_asset_values() {
+        let db = equity_db();
+        link_mortgages(&db);
+        let equity = query_asset_financing(&db, "house", Some(400000.0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(equity.equity_amount, Some(-200000.0));
+        assert_eq!(equity.equity_percent, Some(-50.0));
+        let zero = query_asset_financing(&db, "house", Some(0.0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(zero.equity_amount, Some(-600000.0));
+        assert_eq!(zero.equity_percent, None);
+        let missing = query_asset_financing(&db, "house", None).unwrap().unwrap();
+        assert_eq!(missing.total_debt, Some(600000.0));
+        assert_eq!(missing.equity_amount, None);
+        assert_eq!(missing.equity_percent, None);
+        db.execute("DELETE FROM account_values WHERE account_id='house'", [])
+            .unwrap();
+        set_asset_liabilities_in_db(&db, "house", &[]).unwrap();
+    }
+
+    #[test]
+    fn equity_keeps_paid_retired_and_ignored_links_and_handles_missing_debt() {
+        let db = equity_db();
+        link_mortgages(&db);
+        set_account_retired_in_db(&db, "mortgage-a", true).unwrap();
+        db.execute("UPDATE accounts SET is_ignored=1 WHERE id='mortgage-b'", [])
+            .unwrap();
+        let equity = query_asset_financing(&db, "house", Some(1000000.0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(equity.total_debt, Some(600000.0));
+        assert!(equity.linked_liabilities[0].is_retired);
+        assert!(equity.linked_liabilities[1].is_ignored);
+        db.execute_batch(
+            "INSERT INTO account_values (account_id, balance, recorded_date) VALUES
+            ('mortgage-a', 0, '2026-10-11'), ('mortgage-b', 50, '2026-10-11');",
+        )
+        .unwrap();
+        link_mortgages(&db); // Retaining a paid-off or credit balance is allowed.
+        let paid = query_asset_financing(&db, "house", Some(1000000.0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(paid.linked_liabilities.len(), 2);
+        assert_eq!(paid.equity_amount, Some(1000000.0));
+        assert_eq!(paid.equity_percent, Some(100.0));
+        db.execute(
+            "DELETE FROM account_values WHERE account_id='mortgage-a'",
+            [],
+        )
+        .unwrap();
+        let missing = query_asset_financing(&db, "house", Some(1000000.0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(missing.total_debt, None);
+        assert_eq!(missing.equity_amount, None);
+    }
+
+    #[test]
+    fn liability_assignments_validate_atomically_and_unlink_reversibly() {
+        let db = equity_db();
+        link_mortgages(&db);
+        let original = liability_asset_links(&db).unwrap();
+        for invalid in [
+            "house",
+            "__total__",
+            "no-value",
+            "foreign-loan",
+            "missing",
+            "other-house",
+        ] {
+            assert!(set_asset_liabilities_in_db(
+                &db,
+                "house",
+                &["mortgage-a".into(), invalid.into()]
+            )
+            .is_err());
+            assert_eq!(liability_asset_links(&db).unwrap(), original);
+        }
+        assert!(set_asset_liabilities_in_db(
+            &db,
+            "house",
+            &["mortgage-a".into(), "mortgage-a".into()]
+        )
+        .is_err());
+        assert!(set_asset_liabilities_in_db(&db, "other-house", &["mortgage-a".into()]).is_err());
+        assert!(set_asset_liabilities_in_db(&db, "mortgage-a", &["mortgage-b".into()]).is_err());
+        assert!(set_asset_liabilities_in_db(&db, "__total__", &[]).is_err());
+        assert!(set_asset_liabilities_in_db(&db, "missing", &[]).is_err());
+        assert_eq!(liability_asset_links(&db).unwrap(), original);
+        set_asset_liabilities_in_db(&db, "house", &[]).unwrap();
+        let empty = query_asset_financing(&db, "house", Some(1000000.0))
+            .unwrap()
+            .unwrap();
+        assert!(empty.linked_liabilities.is_empty());
+        assert_eq!(empty.equity_amount, None);
+        assert_eq!(empty.available_liabilities.len(), 2);
+        assert_eq!(
+            db.query_row(
+                "SELECT value FROM settings WHERE key='liability_asset:mortgage-a'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            ""
+        );
+        set_asset_liabilities_in_db(&db, "other-house", &["mortgage-a".into()]).unwrap();
+        let reassigned = query_asset_financing(&db, "other-house", Some(800000.0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(reassigned.equity_amount, Some(300000.0));
+    }
+
+    #[test]
+    fn retirement_preserves_history_and_virtual_progress_and_is_reversible() {
+        let conn = test_db();
+        conn.execute_batch(
+            "INSERT INTO account_values (account_id, balance, recorded_date)
+            VALUES ('account-1', 100, '2026-08-01'), ('account-1', 150, '2026-08-02');",
+        )
+        .unwrap();
+        recompute_total(&conn, "2026-08-02").unwrap();
+        set_account_retired_in_db(&conn, "account-1", true).unwrap();
+        // A later refresh must still include the retired account.
+        recompute_total(&conn, "2026-08-03").unwrap();
+        let summaries = query_accounts_summary(&conn, false).unwrap();
+        let retired = summaries
+            .iter()
+            .find(|s| s.account.id == "account-1")
+            .unwrap();
+        assert!(retired.is_retired);
+        assert_eq!(retired.latest_balance, Some(150.0));
+        assert_eq!(retired.previous_balance, Some(100.0));
+        assert_eq!(
+            summaries
+                .iter()
+                .find(|s| s.account.id == "__total__")
+                .unwrap()
+                .latest_balance,
+            Some(150.0)
+        );
+        let old_total: f64 = conn.query_row("SELECT balance FROM account_values WHERE account_id = '__total__' AND recorded_date = '2026-08-02'", [], |r| r.get(0)).unwrap();
+        assert_eq!(old_total, 150.0);
+        assert!(query_accounts_summary(&conn, true).unwrap().is_empty());
+        set_account_retired_in_db(&conn, "account-1", false).unwrap();
+        assert!(
+            !query_accounts_summary(&conn, false)
+                .unwrap()
+                .iter()
+                .find(|s| s.account.id == "account-1")
+                .unwrap()
+                .is_retired
+        );
+        assert!(set_account_retired_in_db(&conn, "__total__", true).is_err());
+        assert!(set_account_retired_in_db(&conn, "missing", true).is_err());
+        conn.execute(
+            "UPDATE accounts SET is_ignored = 1 WHERE id = 'account-1'",
+            [],
+        )
+        .unwrap();
+        assert!(set_account_retired_in_db(&conn, "account-1", true).is_err());
     }
 
     #[test]
@@ -3152,10 +3618,378 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
+// Read-only mobile snapshots. Financial logic stays in this file.
+// ---------------------------------------------------------------------------
+const MOBILE_SNAPSHOT_VERSION: &str = "1";
+const MAX_SNAPSHOT_BYTES: u64 = 128 * 1024 * 1024;
+
+#[derive(Clone, Default, Serialize)]
+struct SyncStatus {
+    read_only: bool,
+    has_cache: bool,
+    message: String,
+    error: Option<String>,
+    last_sync_at: Option<String>,
+    source_updated_at: Option<String>,
+    published_at: Option<String>,
+}
+
+#[derive(Default)]
+struct SyncState {
+    #[cfg(target_os = "ios")]
+    operation: Mutex<()>,
+    status: Mutex<SyncStatus>,
+}
+
+#[tauri::command]
+fn get_sync_status(state: State<'_, SyncState>) -> Result<SyncStatus, String> {
+    state
+        .status
+        .lock()
+        .map(|s| s.clone())
+        .map_err(|e| e.to_string())
+}
+
+fn snapshot_setting(db: &Connection, key: &str) -> Option<String> {
+    db.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+        r.get(0)
+    })
+    .ok()
+}
+
+/// Read-only validation: never run migrations or execute schema-provided code.
+fn validate_mobile_snapshot(path: &std::path::Path) -> Result<(), String> {
+    let size = fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if size == 0 || size > MAX_SNAPSHOT_BYTES {
+        return Err("Snapshot is empty or exceeds the 128 MB limit".into());
+    }
+    let db = open_db_ro(path)?;
+    db.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON;")
+        .map_err(|e| e.to_string())?;
+    let objects: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('view','trigger')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if objects != 0 {
+        return Err("Snapshot must not contain views or triggers".into());
+    }
+    let integrity: String = db
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if integrity != "ok" {
+        return Err("Snapshot failed its integrity check".into());
+    }
+    for sql in [
+        "SELECT id,name,type,institution,currency,is_manual,is_ignored,interest_rate,repayment_amount,repayment_frequency,repayment_frequency_unit,rate_expiry,initial_next_repayment_date FROM accounts LIMIT 0",
+        "SELECT id,account_id,balance,recorded_date FROM account_values LIMIT 0",
+        "SELECT id,fetched_at FROM fetch_log LIMIT 0",
+        "SELECT key,value FROM settings LIMIT 0",
+    ] { db.prepare(sql).map_err(|e| format!("Unsupported snapshot schema: {e}"))?; }
+    if snapshot_setting(&db, "mobile_snapshot_version").as_deref() != Some(MOBILE_SNAPSHOT_VERSION)
+    {
+        return Err("Unsupported snapshot version. Update My Finances on both devices.".into());
+    }
+    // Exercise the actual summary decoder, not just column existence.
+    query_accounts_summary(&db, false)?;
+    query_accounts_summary(&db, true)?;
+    Ok(())
+}
+
+/// Create a fresh export from one SQLite read transaction. Only allowlisted
+/// tables/settings cross the device boundary; deleted secrets/free pages do not.
+fn create_mobile_snapshot(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<(), String> {
+    if destination.exists() {
+        return Err("Snapshot staging file already exists".into());
+    }
+    // Financial exports must be private even while staged in the system temp
+    // directory. create_new also refuses collisions/symlinks before cleanup owns it.
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    drop(options.open(destination).map_err(|e| e.to_string())?);
+    let result = (|| {
+        let source_db = Connection::open_with_flags(
+            destination,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| e.to_string())?;
+        init_db(&source_db);
+        let encoded: String = source
+            .to_string_lossy()
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b"/-_.".contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect();
+        source_db
+            .execute(
+                "ATTACH DATABASE ?1 AS origin",
+                [format!("file:{encoded}?mode=ro")],
+            )
+            .map_err(|e| e.to_string())?;
+        source_db.execute_batch("BEGIN;
+            INSERT INTO main.accounts SELECT id,name,type,institution,currency,is_manual,is_ignored,interest_rate,repayment_amount,repayment_frequency,repayment_frequency_unit,rate_expiry,initial_next_repayment_date FROM origin.accounts;
+            INSERT INTO main.account_values SELECT id,account_id,balance,recorded_date FROM origin.account_values;
+            INSERT INTO main.fetch_log SELECT id,fetched_at FROM origin.fetch_log;
+            INSERT INTO main.settings SELECT key,value FROM origin.settings
+                WHERE key = 'last_fetch_at' OR key GLOB 'retired_account:*' OR key GLOB 'liability_asset:*';")
+            .map_err(|e| e.to_string())?;
+        source_db
+            .execute(
+                "INSERT INTO main.settings VALUES ('mobile_snapshot_version', ?1)",
+                [MOBILE_SNAPSHOT_VERSION],
+            )
+            .map_err(|e| e.to_string())?;
+        source_db
+            .execute(
+                "INSERT INTO main.settings VALUES ('mobile_snapshot_published_at', ?1)",
+                [Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| e.to_string())?;
+        source_db
+            .execute_batch("COMMIT; DETACH DATABASE origin;")
+            .map_err(|e| e.to_string())?;
+        drop(source_db);
+        validate_mobile_snapshot(destination)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(destination);
+    }
+    result
+}
+
+/// Only a validated closed file can replace the offline cache. Call under the
+/// same local lock used by financial reads; a failed promotion preserves it.
+#[cfg(any(target_os = "ios", test))]
+fn promote_mobile_snapshot(
+    incoming: &std::path::Path,
+    cache: &std::path::Path,
+) -> Result<bool, String> {
+    validate_mobile_snapshot(incoming)?;
+    if cache.exists()
+        && fs::read(incoming).map_err(|e| e.to_string())?
+            == fs::read(cache).map_err(|e| e.to_string())?
+    {
+        fs::remove_file(incoming).map_err(|e| e.to_string())?;
+        return Ok(false);
+    }
+    fs::File::open(incoming)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| e.to_string())?;
+    fs::rename(incoming, cache).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[cfg(not(target_os = "ios"))]
+fn start_mobile_publisher(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let mut previous_source: Vec<u8> = Vec::new();
+        loop {
+            let state = app.state::<AppState>();
+            let sync = app.state::<SyncState>();
+            let attempt = (|| -> Result<Option<(String, Option<String>)>, String> {
+                let root = dirs_next::home_dir()
+                    .ok_or("Home directory unavailable")?
+                    .join("Library/Mobile Documents/com~apple~CloudDocs");
+                if !state.db_path.starts_with(&root) || !root.is_dir() {
+                    return Err("iPhone sync needs iCloud Drive on this Mac.".into());
+                }
+                let _guard = state.local_lock.lock().map_err(|e| e.to_string())?;
+                if fs::metadata(&state.db_path)
+                    .map_err(|e| e.to_string())?
+                    .len()
+                    > MAX_SNAPSHOT_BYTES
+                {
+                    return Err("Database exceeds the mobile snapshot size limit.".into());
+                }
+                let source_bytes = fs::read(&state.db_path).map_err(|e| e.to_string())?;
+                let destination_dir = root.join("my_finances/mobile");
+                let destination = destination_dir.join("read-only.db");
+                if source_bytes == previous_source && destination.exists() {
+                    return Ok(None);
+                }
+                let stage =
+                    std::env::temp_dir().join(format!("my-finances-{}.db", uuid::Uuid::new_v4()));
+                let publication = (|| {
+                    create_mobile_snapshot(&state.db_path, &stage)?;
+                    let snapshot = open_db_ro(&stage)?;
+                    let published = snapshot_setting(&snapshot, "mobile_snapshot_published_at")
+                        .unwrap_or_default();
+                    let fetched = snapshot_setting(&snapshot, "last_fetch_at");
+                    drop(snapshot);
+                    fs::create_dir_all(&destination_dir).map_err(|e| e.to_string())?;
+                    let upload =
+                        destination_dir.join(format!(".snapshot-{}.tmp", uuid::Uuid::new_v4()));
+                    let upload_result = (|| {
+                        fs::copy(&stage, &upload).map_err(|e| e.to_string())?;
+                        fs::File::open(&upload)
+                            .and_then(|f| f.sync_all())
+                            .map_err(|e| e.to_string())?;
+                        fs::rename(&upload, &destination).map_err(|e| e.to_string())
+                    })();
+                    let _ = fs::remove_file(&upload);
+                    upload_result?;
+                    Ok::<_, String>((published, fetched))
+                })();
+                let _ = fs::remove_file(&stage);
+                let values = publication?;
+                previous_source = source_bytes;
+                Ok(Some(values))
+            })();
+            if let Ok(mut status) = sync.status.lock() {
+                match attempt {
+                    Ok(Some((published, fetched))) => {
+                        status.message =
+                            "Snapshot published to iCloud Drive for your iPhone.".into();
+                        status.error = None;
+                        status.published_at = Some(published);
+                        status.source_updated_at = fetched;
+                    }
+                    Ok(None) => {
+                        status.error = None;
+                    }
+                    Err(error) => {
+                        status.error = Some(error);
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(15));
+        }
+    });
+}
+
+#[cfg(target_os = "ios")]
+#[tauri::command]
+async fn sync_mobile_snapshot(app: tauri::AppHandle, connect: bool) -> Result<SyncStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let sync = app.state::<SyncState>();
+        // try_lock coalesces overlapping foreground, timer, and button requests.
+        let _operation = sync
+            .operation
+            .try_lock()
+            .map_err(|_| "A sync is already in progress")?;
+        let state = app.state::<AppState>();
+        let bridge = app.state::<tauri_plugin_finance_sync::FinanceSync<tauri::Wry>>();
+        let incoming = state.db_path.with_file_name("incoming.db");
+        let result = (|| {
+            if connect {
+                bridge.connect()?;
+            }
+            bridge.read_snapshot(&incoming)?;
+            let _guard = state.local_lock.lock().map_err(|e| e.to_string())?;
+            let changed = promote_mobile_snapshot(&incoming, &state.db_path)?;
+            let db = open_db_ro(&state.db_path)?;
+            let mut status = sync.status.lock().map_err(|e| e.to_string())?;
+            status.has_cache = true;
+            status.error = None;
+            status.message = "Read-only · Automatic iCloud sync".into();
+            status.last_sync_at = Some(Utc::now().to_rfc3339());
+            status.source_updated_at = snapshot_setting(&db, "last_fetch_at");
+            status.published_at = snapshot_setting(&db, "mobile_snapshot_published_at");
+            if let Some(time) = &status.last_sync_at {
+                let _ = fs::write(state.db_path.with_file_name("last-sync.txt"), time);
+            }
+            if changed {
+                let _ = app.emit("db-changed", ());
+            }
+            Ok::<_, String>(())
+        })();
+        let _ = fs::remove_file(&incoming);
+        if let Err(error) = result {
+            let mut status = sync.status.lock().map_err(|e| e.to_string())?;
+            status.error = Some(error);
+            status.message = if status.has_cache {
+                "Showing your saved data"
+            } else {
+                "Connect to iCloud Drive"
+            }
+            .into();
+        }
+        let response = sync
+            .status
+            .lock()
+            .map(|s| s.clone())
+            .map_err(|e| e.to_string());
+        response
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(target_os = "ios")]
+#[tauri::mobile_entry_point]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_finance_sync::init())
+        .setup(|app| {
+            let directory = app.path().app_local_data_dir()?;
+            fs::create_dir_all(&directory)?;
+            let db_path = directory.join("read-only.db");
+            let mut status = SyncStatus {
+                read_only: true,
+                message: "Connect to iCloud Drive".into(),
+                ..Default::default()
+            };
+            if db_path.exists() {
+                match validate_mobile_snapshot(&db_path) {
+                    Ok(()) => {
+                        status.has_cache = true;
+                        status.message = "Showing your saved data".into();
+                        let db = open_db_ro(&db_path)?;
+                        status.source_updated_at = snapshot_setting(&db, "last_fetch_at");
+                        status.published_at = snapshot_setting(&db, "mobile_snapshot_published_at");
+                        status.last_sync_at =
+                            fs::read_to_string(directory.join("last-sync.txt")).ok();
+                    }
+                    Err(error) => {
+                        status.error = Some(error);
+                    }
+                }
+            }
+            app.manage(AppState {
+                db_path,
+                local_lock: Mutex::new(()),
+            });
+            app.manage(SyncState {
+                status: Mutex::new(status),
+                ..Default::default()
+            });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_accounts_summary,
+            get_other_accounts_summary,
+            get_account_history,
+            get_account_changes,
+            get_app_version,
+            get_sync_status,
+            sync_mobile_snapshot
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running iOS reader");
+}
+
+// ---------------------------------------------------------------------------
 // App entry point
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
+#[cfg(not(target_os = "ios"))]
 pub fn run() {
     // Load .env file if it exists
     dotenvy::dotenv().ok();
@@ -3209,17 +4043,22 @@ pub fn run() {
                 // Stash the live watcher in managed state, replacing the placeholder.
                 let state = app.state::<AppState>();
                 *state.watcher.lock().unwrap() = watcher;
+                start_mobile_publisher(app.handle().clone());
                 Ok(())
             }
         })
+        .manage(SyncState::default())
         .manage(AppState {
             db_path,
             local_lock: Mutex::new(()),
             watcher: Mutex::new(watcher),
         })
         .invoke_handler(tauri::generate_handler![
+            get_sync_status,
             fetch_akahu_balances,
             get_accounts_summary,
+            set_account_retired,
+            set_asset_liabilities,
             get_other_accounts_summary,
             get_account_history,
             get_account_changes,
@@ -3244,4 +4083,160 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod mobile_sync_tests {
+    use super::*;
+    struct TestDirectory(PathBuf);
+    impl TestDirectory {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("finance-sync-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn source(path: &std::path::Path) {
+        let db = Connection::open(path).unwrap();
+        init_db(&db);
+        db.execute_batch("INSERT INTO accounts(id,name) VALUES ('savings','Savings'),('__total__','Total');
+            INSERT INTO account_values(account_id,balance,recorded_date) VALUES
+                ('savings',150,'2026-09-25'),('__total__',123,'2026-09-25');
+            INSERT INTO settings VALUES ('retired_account:savings','true'),('last_fetch_at','2026-09-25T12:00:00Z'),
+                ('backup_dir','PRIVATE_DIRECTORY'),('akahu_user_token','SECRET_TOKEN');
+            CREATE TABLE private_data(value TEXT); INSERT INTO private_data VALUES ('OTHER_SECRET');").unwrap();
+    }
+    #[test]
+    fn mobile_export_is_consistent_allowlisted_and_does_not_change_source() {
+        let dir = TestDirectory::new();
+        let src = dir.path("source.db");
+        let snapshot = dir.path("snapshot.db");
+        source(&src);
+        let before = fs::read(&src).unwrap();
+        create_mobile_snapshot(&src, &snapshot).unwrap();
+        assert_eq!(before, fs::read(&src).unwrap());
+        let db = open_db_ro(&snapshot).unwrap();
+        assert_eq!(
+            snapshot_setting(&db, "retired_account:savings").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            snapshot_setting(&db, "last_fetch_at").as_deref(),
+            Some("2026-09-25T12:00:00Z")
+        );
+        assert!(snapshot_setting(&db, "backup_dir").is_none());
+        assert!(snapshot_setting(&db, "akahu_user_token").is_none());
+        assert!(db.prepare("SELECT * FROM private_data").is_err());
+        assert_eq!(
+            db.query_row(
+                "SELECT balance FROM account_values WHERE account_id='__total__'",
+                [],
+                |r| r.get::<_, f64>(0)
+            )
+            .unwrap(),
+            123.0
+        );
+        assert!(db.execute("DELETE FROM accounts", []).is_err());
+        let bytes = String::from_utf8_lossy(&fs::read(&snapshot).unwrap()).into_owned();
+        for secret in ["PRIVATE_DIRECTORY", "SECRET_TOKEN", "OTHER_SECRET"] {
+            assert!(!bytes.contains(secret));
+        }
+    }
+    #[test]
+    fn mobile_snapshot_preserves_asset_links_and_equity() {
+        let dir = TestDirectory::new();
+        let src = dir.path("source.db");
+        let snapshot = dir.path("snapshot.db");
+        source(&src);
+        let db = Connection::open(&src).unwrap();
+        db.execute_batch("INSERT INTO accounts(id,name,currency) VALUES ('loan','Loan','NZD');
+            INSERT INTO account_values(account_id,balance,recorded_date) VALUES ('loan',-50,'2026-09-25');
+            INSERT INTO settings VALUES ('liability_asset:loan','savings'),('liability_asset:old-loan','');").unwrap();
+        drop(db);
+        create_mobile_snapshot(&src, &snapshot).unwrap();
+        let db = open_db_ro(&snapshot).unwrap();
+        let equity = query_asset_financing(&db, "savings", Some(150.0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(equity.linked_liabilities.len(), 1);
+        assert_eq!(equity.equity_amount, Some(100.0));
+        assert!((equity.equity_percent.unwrap() - 200.0 / 3.0).abs() < 0.000001);
+        assert_eq!(
+            snapshot_setting(&db, "liability_asset:old-loan").as_deref(),
+            Some("")
+        );
+        assert!(set_asset_liabilities_in_db(&db, "savings", &[]).is_err());
+    }
+
+    #[test]
+    fn invalid_downloads_preserve_cache_and_valid_updates_replace_it() {
+        let dir = TestDirectory::new();
+        let src = dir.path("source.db");
+        let incoming = dir.path("incoming.db");
+        let cache = dir.path("cache.db");
+        source(&src);
+        create_mobile_snapshot(&src, &incoming).unwrap();
+        assert!(promote_mobile_snapshot(&incoming, &cache).unwrap());
+        let saved = fs::read(&cache).unwrap();
+        fs::write(&incoming, b"incomplete iCloud download").unwrap();
+        assert!(promote_mobile_snapshot(&incoming, &cache).is_err());
+        assert_eq!(saved, fs::read(&cache).unwrap());
+        fs::copy(&cache, &incoming).unwrap();
+        assert!(!promote_mobile_snapshot(&incoming, &cache).unwrap());
+        let db = Connection::open(&src).unwrap();
+        db.execute(
+            "UPDATE account_values SET balance=200 WHERE account_id='savings'",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        create_mobile_snapshot(&src, &incoming).unwrap();
+        assert!(promote_mobile_snapshot(&incoming, &cache).unwrap());
+        let db = open_db_ro(&cache).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT balance FROM account_values WHERE account_id='savings'",
+                [],
+                |r| r.get::<_, f64>(0)
+            )
+            .unwrap(),
+            200.0
+        );
+    }
+    #[test]
+    fn incompatible_versions_and_executable_schema_are_rejected() {
+        let dir = TestDirectory::new();
+        let src = dir.path("source.db");
+        let incoming = dir.path("incoming.db");
+        source(&src);
+        create_mobile_snapshot(&src, &incoming).unwrap();
+        let db = Connection::open(&incoming).unwrap();
+        db.execute(
+            "UPDATE settings SET value='999' WHERE key='mobile_snapshot_version'",
+            [],
+        )
+        .unwrap();
+        assert!(validate_mobile_snapshot(&incoming)
+            .unwrap_err()
+            .contains("version"));
+        db.execute(
+            "UPDATE settings SET value='1' WHERE key='mobile_snapshot_version'",
+            [],
+        )
+        .unwrap();
+        db.execute("CREATE VIEW bad AS SELECT * FROM accounts", [])
+            .unwrap();
+        assert!(validate_mobile_snapshot(&incoming)
+            .unwrap_err()
+            .contains("views"));
+    }
 }

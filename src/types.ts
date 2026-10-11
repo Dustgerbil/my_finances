@@ -28,6 +28,7 @@ export interface DeletedValue {
 }
 
 export interface AccountSummary {
+  is_retired: boolean;
   account: Account;
   latest_balance: number | null;
   previous_balance: number | null;
@@ -36,6 +37,8 @@ export interface AccountSummary {
 }
 
 export interface AccountHistory {
+  asset_financing: AssetFinancing | null;
+  is_retired: boolean;
   account: Account;
   values: AccountValue[];
   current_balance: number | null;
@@ -47,6 +50,23 @@ export interface AccountHistory {
   next_repayment_date: string | null;
   estimated_repayment_date: string | null;
   repayment_estimate_status: string | null;
+}
+
+export interface FinancingLiability {
+  id: string;
+  name: string;
+  balance: number | null;
+  recorded_date: string | null;
+  is_retired: boolean;
+  is_ignored: boolean;
+}
+
+export interface AssetFinancing {
+  linked_liabilities: FinancingLiability[];
+  available_liabilities: FinancingLiability[];
+  total_debt: number | null;
+  equity_amount: number | null;
+  equity_percent: number | null;
 }
 
 export interface AccountChange {

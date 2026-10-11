@@ -1,0 +1,12 @@
+[package]
+name = "tauri-plugin-finance-sync"
+version = "0.1.0"
+edition = "2021"
+links = "tauri-plugin-finance-sync"
+
+[dependencies]
+tauri = { version = "2" }
+serde_json = "1"
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }

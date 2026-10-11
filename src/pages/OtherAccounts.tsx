@@ -1,3 +1,4 @@
+import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useNavigate } from "react-router";
@@ -39,7 +40,11 @@ export default function OtherAccounts() {
   }, []);
 
   useEffect(() => {
-    loadAccounts();
+    void loadAccounts();
+    let disposed = false;
+    let stop: (() => void) | undefined;
+    listen("db-changed", () => void loadAccounts()).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten; });
+    return () => { disposed = true; stop?.(); };
   }, [loadAccounts]);
 
   return (

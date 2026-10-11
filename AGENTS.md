@@ -177,6 +177,7 @@ graphs zig-zag vertically and look "stale". (See history fix, 2026-06-18.)
 | `get_accounts_summary` | Cards data, incl. virtual accounts (`id LIKE '__'`). |
 | `get_other_accounts_summary` | Latest values for ignored real accounts only; excludes all virtual totals. |
 | `get_account_history` | Per-account values for the line chart. |
+| `set_asset_liabilities` | Atomically replace an asset's linked liabilities; each liability can belong to one asset. Desktop only. |
 | `get_account_changes` | 30d/90d/180d/270d/360d/all-time change chips (lookback by recorded_date). |
 | `get_all_accounts_config` | All real accounts (excl. virtual) for config screen. |
 | `toggle_ignore_account` | Flip `is_ignored`; recomputes totals. Virtual accounts rejected. |
@@ -218,9 +219,24 @@ graphs zig-zag vertically and look "stale". (See history fix, 2026-06-18.)
   up arrow for higher and down arrow for lower. Unchanged values and accounts
   with fewer than two values show no direction. Same-day refreshes replace
   today's value, so the comparison remains against the previous saved day.
+- **Retired accounts:** `settings` keys `retired_account:<id>` store `true`/`false`.
+  `AccountSummary.is_retired` controls dashboard card visibility; summaries still
+  include retired accounts so virtual breakdown charts remain consistent with totals.
+  `/retired-accounts` provides history access; retirement and restoration toggles
+  live on individual Account Detail pages (`AccountHistory.is_retired`). Retirement never
+  changes balances, total inclusion, or historical snapshots. Restore a retired
+  account before ignoring it; virtual and ignored accounts cannot be retired.
 - **Ignore:** ignored accounts are hidden from the dashboard and excluded from
   virtual total sums, but remain visible with their latest values on the
   read-only Other Accounts screen.
+- **Asset equity:** `settings` keys `liability_asset:<liability id>` hold the asset
+  id; an empty value explicitly unlinks it and survives keep-live conflict merges.
+  `AccountHistory.asset_financing` supplies linked liabilities, available choices,
+  debt, equity amount and equity percentage. Calculations use latest recorded
+  balances, with debt `max(-balance, 0)`. Missing balances prevent calculation;
+  zero/non-positive asset values have no percentage. Links preserve paid-off,
+  retired and ignored liabilities and never change virtual totals. The Mac snapshot
+  exports these settings for read-only iOS display. See `docs/asset-equity.md`.
 - **Changes lookback:** `get_account_changes` returns `None` for a fixed period
   when the account's earliest recorded_date is after the lookback date (not
   enough history yet). The all-time change compares the latest balance with the
@@ -256,6 +272,22 @@ graphs zig-zag vertically and look "stale". (See history fix, 2026-06-18.)
 
 - ⚠️ **Ask first** before: database schema changes, adding dependencies.
 - 🚫 **Never:** commit secrets, edit `node_modules/`, modify CI config.
+
+## iOS read-only reader
+
+- See `docs/ios-read-only-sync.md`. Build with `bash scripts/ios.sh build --debug
+  --target aarch64-sim --no-sign --ci`; the script selects Xcode locally.
+- Keep iOS financial commands read-only. Do not register desktop mutation,
+  credential, backup, or Akahu commands in the iOS handler, or run desktop database
+  startup/migrations on the mobile cache.
+- Mac exports only financial tables and allowlisted settings into
+  `iCloud Drive/my_finances/mobile/read-only.db`. Never export credentials or
+  machine-local configuration. Preserve stored historical totals and retirement.
+- The native iOS bridge remembers a user-selected folder bookmark, coordinates
+  downloads, and stages local snapshots. Validate before atomic cache replacement;
+  failures must preserve the last valid offline data.
+- Simulator checks do not prove real-device iCloud delivery or Personal Team
+  provisioning. Report those verification boundaries explicitly.
 
 ## When you change something
 

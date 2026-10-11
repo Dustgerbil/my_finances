@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
+import { IPhoneSyncSettings } from "../sync";
 import type { BackupSettings, DataHealth } from "../types";
 
 export default function Settings() {
@@ -327,6 +328,8 @@ export default function Settings() {
           {restorePath && <div className="restore-path">{restorePath}</div>}
         </div>
       </div>
+
+      <IPhoneSyncSettings />
 
       <section className="card data-health" aria-labelledby="data-health-title">
         <div className="data-health-header">

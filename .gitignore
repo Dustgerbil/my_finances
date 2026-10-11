@@ -10,6 +10,10 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+plugins/**/.tauri/
+plugins/**/.build/
+src-tauri/gen/apple/build/
+src-tauri/gen/apple/Externals/
 *.local
 
 # Editor directories and files

@@ -1,3 +1,4 @@
+import { useReadOnly } from "../sync";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
@@ -6,6 +7,7 @@ import { Cell, Pie, PieChart } from "recharts";
 import type { AccountSummary, AccountChange } from "../types";
 import { formatAccountType } from "../format";
 import BalanceDirection from "../components/BalanceDirection";
+import { daysUntilRateExpiry } from "../rateExpiry";
 
 const ACCOUNT_MIX_COLORS = ["#4f46e5", "#0ea5e9", "#14b8a6", "#f59e0b", "#94a3b8"];
 const MAX_NAMED_ACCOUNT_SLICES = 4;
@@ -44,6 +46,7 @@ function buildAccountMix(items: AccountSummary[]): AccountMixSlice[] {
 }
 
 export default function Dashboard() {
+  const readOnly = useReadOnly();
   const navigate = useNavigate();
   const [accounts, setAccounts] = useState<AccountSummary[]>([]);
   const [loading, setLoading] = useState(false);
@@ -55,6 +58,19 @@ export default function Dashboard() {
   } | null>(null);
   const [hasCredentials, setHasCredentials] = useState<boolean | null>(null);
   const didAutofetch = useRef(false);
+  const [today, setToday] = useState(() => new Date());
+
+  useEffect(() => {
+    const updateToday = () => setToday(new Date());
+    const timer = window.setInterval(updateToday, 60_000);
+    window.addEventListener("focus", updateToday);
+    document.addEventListener("visibilitychange", updateToday);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", updateToday);
+      document.removeEventListener("visibilitychange", updateToday);
+    };
+  }, []);
 
   const checkCredentials = useCallback(async () => {
     try {
@@ -95,6 +111,7 @@ export default function Dashboard() {
 
   // Auto-fetch on first load if enabled
   useEffect(() => {
+    if (readOnly) return;
     const init = async () => {
       const enabled = await invoke<boolean>("get_autofetch_setting").catch(() => false);
 
@@ -123,7 +140,7 @@ export default function Dashboard() {
     };
     init();
     checkCredentials();
-  }, [checkCredentials, loadAccounts]);
+  }, [checkCredentials, loadAccounts, readOnly]);
 
   useEffect(() => {
     loadAccounts();
@@ -197,6 +214,11 @@ export default function Dashboard() {
   const negativeAccounts = accounts.filter(
     (a) => !a.account.id.startsWith("__") && (a.latest_balance ?? 0) < 0
   );
+  const expiringRates = negativeAccounts.flatMap((item) => {
+    if (item.is_retired || item.account.is_ignored) return [];
+    const days = daysUntilRateExpiry(item.account.rate_expiry, today);
+    return days != null && days >= 0 && days < 30 ? [{ item, days }] : [];
+  }).sort((a, b) => a.days - b.days);
 
   const renderGrandTotalWaterfall = () => {
     const assets = assetsTotal?.latest_balance;
@@ -206,7 +228,6 @@ export default function Dashboard() {
     if (assets == null && liabilities == null && netTotal == null) {
       return (
         <div className="virtual-composition">
-          <div className="virtual-composition-title">How the total is calculated</div>
           <div className="virtual-composition-empty">No balances yet</div>
         </div>
       );
@@ -234,7 +255,6 @@ export default function Dashboard() {
 
     return (
       <div className="virtual-composition grand-total-composition">
-        <div className="virtual-composition-title">How the total is calculated</div>
         <svg
           className="grand-total-waterfall"
           viewBox="0 0 300 140"
@@ -290,9 +310,6 @@ export default function Dashboard() {
             Net total
           </text>
         </svg>
-        <div className="waterfall-equation" aria-hidden="true">
-          Assets − liabilities = Grand Total
-        </div>
       </div>
     );
   };
@@ -366,9 +383,9 @@ export default function Dashboard() {
       isNegative ? " negative" : "",
     ].join("");
     return (
+      <div key={item.account.id} className={`account-card-container${isVirtual ? " virtual-card" : ""}`}>
       <button
         type="button"
-        key={item.account.id}
         className={`card account-card${cls}`}
         onClick={() => navigate(`/account/${encodeURIComponent(item.account.id)}`)}
         aria-label={`View ${item.account.name} account details`}
@@ -438,6 +455,7 @@ export default function Dashboard() {
             : isVirtual && renderAccountMix(mixAccounts)}
         </div>
       </button>
+      </div>
     );
   };
 
@@ -446,13 +464,16 @@ export default function Dashboard() {
       <div className="header">
         <h1>My Finances</h1>
         <div className="header-actions">
+          <button className="btn btn-secondary" onClick={() => navigate("/retired-accounts")}>
+            Retired Accounts
+          </button>
           <button
             className="btn btn-secondary"
             onClick={() => navigate("/other-accounts")}
           >
             Other Accounts
           </button>
-          <button
+          {!readOnly && <><button
             className="btn btn-primary"
             onClick={handleFetch}
             disabled={fetching}
@@ -465,7 +486,7 @@ export default function Dashboard() {
             title="Settings"
           >
             ⚙
-          </button>
+          </button></>}
         </div>
       </div>
 
@@ -473,7 +494,25 @@ export default function Dashboard() {
         <div className={`status status-${status.type}`}>{status.message}</div>
       )}
 
-      {hasCredentials === false && (
+      {expiringRates.length > 0 && (
+        <section className="status rate-expiry-notice" aria-label="Upcoming rate expiries" role="status">
+          <strong>Rate expiry approaching</strong>
+          <ul>
+            {expiringRates.map(({ item, days }) => (
+              <li key={item.account.id}>
+                <a href={`/account/${encodeURIComponent(item.account.id)}`} onClick={(event) => {
+                  event.preventDefault();
+                  navigate(`/account/${encodeURIComponent(item.account.id)}`);
+                }}>{item.account.name}</a>
+                {" — rate expires "}{days === 0 ? "today" : `in ${days} ${days === 1 ? "day" : "days"}`}
+                {" ("}{new Date(`${item.account.rate_expiry}T00:00:00`).toLocaleDateString()}{")."}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {!readOnly && hasCredentials === false && (
         <div className="status status-error" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <span>⚠ Akahu credentials not found. Please add them in Settings.</span>
           <button className="btn btn-primary" onClick={() => navigate("/settings")} style={{ marginLeft: "12px", whiteSpace: "nowrap" }}>
@@ -489,7 +528,7 @@ export default function Dashboard() {
       ) : accounts.length === 0 ? (
         <div className="empty-state">
           <p>No accounts yet.</p>
-          <p>Click "Refresh now" to get started, or add a manual account in config.</p>
+          <p>{readOnly ? "Accounts will appear after your Mac publishes them." : 'Click "Refresh now" to get started, or add a manual account in config.'}</p>
         </div>
       ) : (
         <>
@@ -504,7 +543,7 @@ export default function Dashboard() {
               <h2 className="section-title">Assets &amp; Savings</h2>
               <div className="card-grid">
                 {assetsTotal && renderCard(assetsTotal)}
-                {positiveAccounts.map((a) => renderCard(a))}
+                {positiveAccounts.filter((a) => !a.is_retired).map((a) => renderCard(a))}
               </div>
             </>
           )}
@@ -515,7 +554,7 @@ export default function Dashboard() {
               <h2 className="section-title">Liabilities</h2>
               <div className="card-grid">
                 {liabilitiesTotal && renderCard(liabilitiesTotal, true)}
-                {negativeAccounts.map((a) => renderCard(a, true))}
+                {negativeAccounts.filter((a) => !a.is_retired).map((a) => renderCard(a, true))}
               </div>
             </>
           )}

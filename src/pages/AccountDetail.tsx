@@ -1,3 +1,4 @@
+import { useReadOnly } from "../sync";
 import { useState, useEffect, useCallback } from "react";
 import { useNavigate, useParams } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
@@ -18,6 +19,8 @@ import {
   formatAdaptiveAxisTick,
 } from "../chartAxis";
 import BalanceDirection from "../components/BalanceDirection";
+import RetirementToggle from "../components/RetirementToggle";
+import AssetLiabilities from "../components/AssetLiabilities";
 
 type ChartRange = "1m" | "6m" | "1y" | "all";
 
@@ -43,6 +46,7 @@ function subtractMonths(dateString: string, months: number) {
 }
 
 export default function AccountDetail() {
+  const readOnly = useReadOnly();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [data, setData] = useState<AccountHistory | null>(null);
@@ -328,6 +332,13 @@ export default function AccountDetail() {
         </div>
       </div>
 
+      {!readOnly && !data.account.id.startsWith("__") && !data.account.is_ignored && (
+        <div className="retirement-details">
+          <RetirementToggle item={data} onChanged={loadHistory} />
+          <p>Retired accounts appear on the Retired Accounts page. Their balances and history still count toward virtual-account progress.</p>
+        </div>
+      )}
+
       {data.values.length > 0 ? (
         <div className="chart-container">
           <div className="chart-header">
@@ -451,6 +462,16 @@ export default function AccountDetail() {
       </div>
 
       {/* Historical changes */}
+      {data.asset_financing && (
+        <AssetLiabilities
+          key={data.account.id}
+          assetId={data.account.id}
+          financing={data.asset_financing}
+          readOnly={readOnly}
+          onChanged={loadHistory}
+        />
+      )}
+
       {changes.length > 0 && (
         <div className="changes-section">
           <h3>Change over time</h3>
@@ -509,7 +530,7 @@ export default function AccountDetail() {
           <div className="card liability-repayment-form">
             <div className="repayment-details-header">
               <h3>Repayment details</h3>
-              {!editingRepayment && !data.account.id.startsWith("__") && (
+              {!readOnly && !editingRepayment && !data.account.id.startsWith("__") && (
                 <button
                   type="button"
                   className="btn"
@@ -523,7 +544,7 @@ export default function AccountDetail() {
               )}
             </div>
 
-            {editingRepayment && !data.account.id.startsWith("__") ? (
+            {!readOnly && editingRepayment && !data.account.id.startsWith("__") ? (
               <>
                 <p>All fields are optional. Complete all except rate expiry to calculate an estimate.</p>
                 <div className="repayment-form-grid">
@@ -698,7 +719,7 @@ export default function AccountDetail() {
         )}
 
       {/* Manual account: add value form */}
-      {data.account.is_manual && (
+      {!readOnly && data.account.is_manual && (
         <div className="card add-value-form">
           <div className="form-group">
             <label htmlFor="addValue">Add today's balance</label>

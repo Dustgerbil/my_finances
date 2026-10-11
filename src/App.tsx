@@ -1,7 +1,9 @@
+import { useReadOnly } from "./sync";
 import { Component, lazy, Suspense, type ErrorInfo, type ReactNode } from "react";
-import { Routes, Route } from "react-router";
+import { Routes, Route, Navigate } from "react-router";
 
 const Dashboard = lazy(() => import("./pages/Dashboard"));
+const RetiredAccounts = lazy(() => import("./pages/RetiredAccounts"));
 const OtherAccounts = lazy(() => import("./pages/OtherAccounts"));
 const AccountDetail = lazy(() => import("./pages/AccountDetail"));
 const AccountsConfig = lazy(() => import("./pages/AccountsConfig"));
@@ -52,16 +54,18 @@ class AppErrorBoundary extends Component<
 }
 
 function App() {
+  const readOnly = useReadOnly();
   return (
     <div className="app">
       <AppErrorBoundary>
         <Suspense fallback={<div className="empty-state"><p>Loading…</p></div>}>
           <Routes>
             <Route path="/" element={<Dashboard />} />
+            <Route path="/retired-accounts" element={<RetiredAccounts />} />
             <Route path="/other-accounts" element={<OtherAccounts />} />
             <Route path="/account/:id" element={<AccountDetail />} />
-            <Route path="/config" element={<AccountsConfig />} />
-            <Route path="/settings" element={<Settings />} />
+            <Route path="/config" element={readOnly ? <Navigate to="/" replace /> : <AccountsConfig />} />
+            <Route path="/settings" element={readOnly ? <Navigate to="/" replace /> : <Settings />} />
           </Routes>
         </Suspense>
       </AppErrorBoundary>
