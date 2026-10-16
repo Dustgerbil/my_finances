@@ -465,18 +465,6 @@ function AccountDetailScreen({ id }: { id: string | undefined }) {
       </div>
 
       {/* Historical changes */}
-      {(data.asset_financing || data.combined_financing) && (
-        <AssetLiabilities
-          key={data.account.id}
-          assetId={data.account.id}
-          financing={data.asset_financing ?? { linked_liabilities: [], available_liabilities: [], total_debt: null, equity_amount: null, equity_percent: null }}
-          summary={data.combined_financing}
-          readOnly={readOnly}
-          onChanged={loadHistory}
-          onEditingChange={setEditingLinks}
-        />
-      )}
-
       {changes.length > 0 && (
         <div className="changes-section">
           <h3>Change over time</h3>
@@ -526,6 +514,18 @@ function AccountDetailScreen({ id }: { id: string | undefined }) {
             })}
           </div>
         </div>
+      )}
+
+      {(data.asset_financing || data.combined_financing) && (
+        <AssetLiabilities
+          key={data.account.id}
+          assetId={data.account.id}
+          financing={data.asset_financing ?? { linked_liabilities: [], available_liabilities: [], total_debt: null, equity_amount: null, equity_percent: null }}
+          summary={data.combined_financing}
+          readOnly={readOnly}
+          onChanged={loadHistory}
+          onEditingChange={setEditingLinks}
+        />
       )}
 
       {ownData?.current_balance != null &&
