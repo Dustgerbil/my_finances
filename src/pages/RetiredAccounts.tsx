@@ -1,5 +1,5 @@
 import { useReadOnly } from "../sync";
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { useLiveData } from "../useLiveData";
@@ -13,7 +13,8 @@ export default function RetiredAccounts() {
     return accounts.filter((item) => item.is_retired);
   }, []);
   const { data, loading, error } = useLiveData(readAccounts);
-  const accounts = data ?? [];
+  const [individualAssets, setIndividualAssets] = useState<Record<string, boolean>>({});
+  const accounts = (data ?? []).map(raw => raw.combined && !individualAssets[raw.account.id] ? { ...raw, ...raw.combined } : raw);
   return (
     <div>
       <button className="btn btn-back" onClick={() => navigate("/")}>← Back to Home</button>
@@ -33,9 +34,15 @@ export default function RetiredAccounts() {
                 aria-label={`View ${item.account.name} account details`}>
                 <div className="account-name">{item.account.name}{item.account.is_manual && <span className="manual-badge">Manual</span>}</div>
                 <div className="account-institution">{item.account.institution}</div>
+              {item.combined && <div className="account-date">{individualAssets[item.account.id] ? "This asset only" : `Combined · ${item.combined.account_count} accounts`}</div>}
                 <div className="account-balance">{item.latest_balance == null ? "—" : new Intl.NumberFormat("en-NZ", { style: "currency", currency: item.account.currency }).format(item.latest_balance)}</div>
                 {item.latest_date && <div className="account-date">As at {item.latest_date}</div>}
               </button>
+              {item.combined && <button className="btn btn-secondary asset-card-toggle" aria-pressed={!!individualAssets[item.account.id]}
+                onClick={() => setIndividualAssets(previous => ({ ...previous, [item.account.id]: !previous[item.account.id] }))}>
+                {individualAssets[item.account.id] ? "Show combined assets" : "Show this asset only"}
+              </button>}
+
             </div>
           ))}
         </div>

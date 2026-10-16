@@ -14,9 +14,10 @@ function liabilityDetails(item: FinancingLiability) {
     .filter(Boolean).join(" · ");
 }
 
-export default function AssetLiabilities({ assetId, financing, readOnly, onChanged, onEditingChange }: {
+export default function AssetLiabilities({ assetId, financing, summary, readOnly, onChanged, onEditingChange }: {
   assetId: string;
   financing: AssetFinancing;
+  summary?: AssetFinancing | null;
   readOnly: boolean;
   onChanged: () => Promise<void>;
   onEditingChange: (editing: boolean) => void;
@@ -27,6 +28,8 @@ export default function AssetLiabilities({ assetId, financing, readOnly, onChang
   const [error, setError] = useState<string | null>(null);
   useEffect(() => { onEditingChange(editing || saving); }, [editing, saving, onEditingChange]);
   const linked = financing.linked_liabilities;
+  const figures = summary ?? financing;
+  const displayedLinks = figures.linked_liabilities;
   const options = [...linked, ...financing.available_liabilities];
 
   async function save() {
@@ -43,7 +46,7 @@ export default function AssetLiabilities({ assetId, financing, readOnly, onChang
     }
   }
 
-  if (readOnly && linked.length === 0) return null;
+  if (readOnly && displayedLinks.length === 0) return null;
 
   return (
     <section className="card asset-liabilities" aria-labelledby="asset-liabilities-title">
@@ -58,35 +61,35 @@ export default function AssetLiabilities({ assetId, financing, readOnly, onChang
         )}
       </div>
 
-      {linked.length > 0 && (
+      {displayedLinks.length > 0 && (
         <>
           <div className="detail-stats equity-stats">
             <div className="detail-stat">
               <div className="stat-label">Linked debt</div>
-              <div className="stat-value">{money(financing.total_debt)}</div>
+              <div className="stat-value">{money(figures.total_debt)}</div>
             </div>
             <div className="detail-stat">
               <div className="stat-label">Equity</div>
-              <div className={`stat-value ${(financing.equity_amount ?? 0) < 0 ? "stat-min" : "stat-current"}`}>
-                {money(financing.equity_amount)}
+              <div className={`stat-value ${(figures.equity_amount ?? 0) < 0 ? "stat-min" : "stat-current"}`}>
+                {money(figures.equity_amount)}
               </div>
             </div>
             <div className="detail-stat">
               <div className="stat-label">Equity percentage</div>
-              <div className="stat-value">{financing.equity_percent == null ? "—" : `${financing.equity_percent.toFixed(1)}%`}</div>
+              <div className="stat-value">{figures.equity_percent == null ? "—" : `${figures.equity_percent.toFixed(1)}%`}</div>
             </div>
           </div>
           <p className="calculation-note">
-            Equity is the asset’s latest recorded value minus its linked debts. Credit balances count as zero debt.
-            {financing.equity_amount == null && " A recorded value is missing; equity is unavailable."}
-            {financing.equity_amount != null && financing.equity_percent == null && " Equity percentage requires an asset value greater than zero."}
+            {summary ? "Combined equity uses all linked assets and their debts. Edit each asset to change the liabilities attached to it." : "Equity is this asset’s latest recorded value minus its linked debts."} Credit balances count as zero debt.
+            {figures.equity_amount == null && " A recorded value is missing; equity is unavailable."}
+            {figures.equity_amount != null && figures.equity_percent == null && " Equity percentage requires an asset value greater than zero."}
           </p>
         </>
       )}
 
       {editing ? (
         <>
-          <p className="calculation-note">Select the liabilities that funded this asset. Each liability can be linked to one asset; unlink it there before moving it here. Changes apply when you save.</p>
+          <p className="calculation-note">Select the liabilities that funded this asset only. Each liability can be linked to one asset; unlink it there before moving it here. Changes apply when you save.</p>
           <fieldset className="liability-options" disabled={saving}>
             <legend>Liabilities that funded this asset</legend>
             {options.map((item) => (
@@ -106,9 +109,9 @@ export default function AssetLiabilities({ assetId, financing, readOnly, onChang
             <button className="btn btn-secondary" disabled={saving} onClick={() => { setEditing(false); setError(null); }}>Cancel</button>
           </div>
         </>
-      ) : linked.length ? (
+      ) : displayedLinks.length ? (
         <ul className="linked-liabilities-list">
-          {linked.map((item) => (
+          {displayedLinks.map((item) => (
             <li className="liability-link-row" key={item.id}>
               <span className="liability-link-name">
                 <Link to={`/account/${encodeURIComponent(item.id)}`}>{item.name}</Link>

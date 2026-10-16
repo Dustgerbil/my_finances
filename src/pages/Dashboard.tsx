@@ -78,13 +78,17 @@ export default function Dashboard() {
     }
   }, []);
 
+  const [individualAssets, setIndividualAssets] = useState<Record<string, boolean>>({});
   const readAccounts = useCallback(async () => {
     const accounts = await invoke<AccountSummary[]>("get_accounts_summary");
     const results = await Promise.all(accounts.map(async (item) => {
       const changes = await invoke<AccountChange[]>("get_account_changes", {
         accountId: item.account.id,
       }).catch(() => []);
-      return [item.account.id, changes] as const;
+      const individualChanges = item.combined ? await invoke<AccountChange[]>("get_account_changes", {
+        accountId: item.account.id, includeLinked: false,
+      }).catch(() => []) : changes;
+      return [item.account.id, { combined: changes, individual: individualChanges }] as const;
     }));
     return { accounts, changes: Object.fromEntries(results) };
   }, []);
@@ -324,8 +328,11 @@ export default function Dashboard() {
     );
   };
 
-  const renderCard = (item: AccountSummary, isNegative = false) => {
-    const id = item.account.id;
+  const renderCard = (raw: AccountSummary, isNegative = false) => {
+    const id = raw.account.id;
+    const individual = !!individualAssets[id];
+    const item = raw.combined && !individual ? { ...raw, ...raw.combined } : raw;
+    const cardChanges = individual ? changes[id]?.individual : changes[id]?.combined;
     const isVirtual = id.startsWith("__");
     const isTotal = id === "__total__";
     const isSubTotal = id === "__assets_total__" || id === "__liabilities_total__";
@@ -363,6 +370,7 @@ export default function Dashboard() {
               {item.account.institution}
               {item.account.type ? ` · ${formatAccountType(item.account.type)}` : ""}
             </div>
+            {raw.combined && <div className="account-date">{individual ? "This asset only" : `Combined · ${raw.combined.account_count} accounts`}</div>}
             <div className="account-balance balance-with-direction">
               <span>{formatCurrency(item.latest_balance)}</span>
               <BalanceDirection
@@ -380,9 +388,9 @@ export default function Dashboard() {
                 As at {formatDate(item.latest_date)}
               </div>
             )}
-            {changes[item.account.id] && changes[item.account.id].length > 0 && (
+            {cardChanges && cardChanges.length > 0 && (
               <div className="account-changes">
-                {changes[item.account.id].map((ch) => {
+                {cardChanges.map((ch) => {
                   if (ch.change_amount == null) return null;
                   const symbol =
                     ch.period === "30d"
@@ -416,6 +424,11 @@ export default function Dashboard() {
             : isVirtual && renderAccountMix(mixAccounts)}
         </div>
       </button>
+      {raw.combined && <button className="btn btn-secondary asset-card-toggle" aria-pressed={individual}
+        aria-label={`${individual ? "Show combined assets" : "Show this asset only"}: ${item.account.name}`}
+        onClick={() => setIndividualAssets(previous => ({ ...previous, [id]: !previous[id] }))}>
+        {individual ? "Show combined assets" : "Show this asset only"}
+      </button>}
       </div>
     );
   };

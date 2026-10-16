@@ -1,5 +1,5 @@
 import { useLiveData } from "../useLiveData";
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useNavigate } from "react-router";
 import { formatAccountType } from "../format";
@@ -27,7 +27,8 @@ export default function OtherAccounts() {
     return accounts;
   }, []);
   const { data, loading, error } = useLiveData(readAccounts);
-  const accounts = data ?? [];
+  const [individualAssets, setIndividualAssets] = useState<Record<string, boolean>>({});
+  const accounts = (data ?? []).map(raw => raw.combined && !individualAssets[raw.account.id] ? { ...raw, ...raw.combined } : raw);
   return (
     <div>
       <button className="btn btn-back" onClick={() => navigate("/")}>
@@ -66,6 +67,7 @@ export default function OtherAccounts() {
                   ? ` · ${formatAccountType(item.account.type)}`
                   : ""}
               </div>
+              {item.combined && <div className="account-date">{individualAssets[item.account.id] ? "This asset only" : `Combined · ${item.combined.account_count} accounts`}</div>}
               <div
                 className={`account-balance${
                   (item.latest_balance ?? 0) < 0 ? " negative" : ""
@@ -78,6 +80,10 @@ export default function OtherAccounts() {
                   As at {formatDate(item.latest_date)}
                 </div>
               )}
+              {item.combined && <button className="btn btn-secondary asset-card-toggle" aria-pressed={!!individualAssets[item.account.id]}
+                onClick={() => setIndividualAssets(previous => ({ ...previous, [item.account.id]: !previous[item.account.id] }))}>
+                {individualAssets[item.account.id] ? "Show combined assets" : "Show this asset only"}
+              </button>}
             </div>
           ))}
         </div>

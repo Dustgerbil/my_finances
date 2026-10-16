@@ -68,7 +68,24 @@ pub struct AccountValue {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CombinedAssetSummary {
+    pub account_count: usize,
+    pub latest_balance: Option<f64>,
+    pub previous_balance: Option<f64>,
+    pub latest_date: Option<String>,
+    pub max_balance: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AssetLinks {
+    pub linked_assets: Vec<FinancingLiability>,
+    pub available_assets: Vec<FinancingLiability>,
+    pub primary_asset: Option<FinancingLiability>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AccountSummary {
+    pub combined: Option<CombinedAssetSummary>,
     pub is_retired: bool,
     pub account: Account,
     pub latest_balance: Option<f64>,
@@ -79,6 +96,8 @@ pub struct AccountSummary {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AccountHistory {
+    pub combined_financing: Option<AssetFinancing>,
+    pub asset_links: Option<AssetLinks>,
     pub asset_financing: Option<AssetFinancing>,
     pub is_retired: bool,
     pub account: Account,
@@ -1336,6 +1355,7 @@ fn query_accounts_summary(
     let summaries = stmt
         .query_map([], |row| {
             Ok(AccountSummary {
+                combined: None,
                 account: Account {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -1367,12 +1387,12 @@ fn query_accounts_summary(
 
 #[tauri::command]
 fn get_accounts_summary(state: State<'_, AppState>) -> Result<Vec<AccountSummary>, String> {
-    with_db_ro(&state, |db| query_accounts_summary(db, false))
+    with_db_ro(&state, |db| query_display_summaries(db, false))
 }
 
 #[tauri::command]
 fn get_other_accounts_summary(state: State<'_, AppState>) -> Result<Vec<AccountSummary>, String> {
-    with_db_ro(&state, |db| query_accounts_summary(db, true))
+    with_db_ro(&state, |db| query_display_summaries(db, true))
 }
 
 // Retirement is a visibility preference, independent of balance history and totals.
@@ -1414,6 +1434,238 @@ fn set_account_retired(
     with_db_rw(&state, |db| {
         set_account_retired_in_db(db, &account_id, retired)
     })
+}
+
+// Asset links are a single-level group: one primary account and its provider accounts.
+// Raw summaries remain the source for totals, reports, debt and account editing.
+fn asset_parent_links(
+    db: &Connection,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut stmt = db.prepare("SELECT substr(key, 14), value FROM settings WHERE key GLOB 'asset_parent:*' AND value != ''")
+        .map_err(|e| e.to_string())?;
+    let links = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(links)
+}
+
+fn asset_member_ids(db: &Connection, asset_id: &str) -> Result<Vec<String>, String> {
+    let mut ids = vec![asset_id.to_string()];
+    if !asset_id.starts_with("__") {
+        ids.extend(
+            asset_parent_links(db)?
+                .into_iter()
+                .filter(|(child, parent)| {
+                    parent == asset_id && child != asset_id && !child.starts_with("__")
+                })
+                .map(|(child, _)| child),
+        );
+    }
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+fn query_asset_links(db: &Connection, asset_id: &str) -> Result<Option<AssetLinks>, String> {
+    if asset_id.starts_with("__") {
+        return Ok(None);
+    }
+    let links = asset_parent_links(db)?;
+    let debts = liability_asset_links(db)?;
+    let mut accounts = query_accounts_summary(db, false)?;
+    accounts.extend(query_accounts_summary(db, true)?);
+    let asset = accounts
+        .iter()
+        .find(|a| a.account.id == asset_id)
+        .ok_or("Asset not found")?;
+    let eligible = asset.account.currency == "NZD"
+        && !debts.contains_key(asset_id)
+        && asset
+            .latest_balance
+            .is_some_and(|b| b.is_finite() && b >= 0.0);
+    let has_links = links.contains_key(asset_id) || links.values().any(|id| id == asset_id);
+    if !eligible && !has_links {
+        return Ok(None);
+    }
+    let mut result = AssetLinks {
+        linked_assets: vec![],
+        available_assets: vec![],
+        primary_asset: None,
+    };
+    for item in accounts {
+        let id = &item.account.id;
+        if id == asset_id || id.starts_with("__") {
+            continue;
+        }
+        let linked = links.get(id).is_some_and(|parent| parent == asset_id);
+        let primary = links.get(asset_id).is_some_and(|parent| parent == id);
+        let available = eligible
+            && !links.contains_key(asset_id)
+            && !links.contains_key(id)
+            && !links.values().any(|parent| parent == id)
+            && !debts.contains_key(id)
+            && item.account.currency == "NZD"
+            && item
+                .latest_balance
+                .is_some_and(|b| b.is_finite() && b >= 0.0);
+        let choice = FinancingLiability {
+            id: item.account.id,
+            name: item.account.name,
+            balance: item.latest_balance,
+            recorded_date: item.latest_date,
+            is_retired: item.is_retired,
+            is_ignored: item.account.is_ignored,
+        };
+        if linked {
+            result.linked_assets.push(choice);
+        } else if primary {
+            result.primary_asset = Some(choice);
+        } else if available {
+            result.available_assets.push(choice);
+        }
+    }
+    Ok(Some(result))
+}
+
+fn set_linked_assets_in_db(
+    db: &Connection,
+    asset_id: &str,
+    linked_asset_ids: &[String],
+) -> Result<(), String> {
+    let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
+    let options = query_asset_links(&tx, asset_id)?
+        .ok_or("Choose a real NZD asset with a non-negative recorded value")?;
+    if options.primary_asset.is_some() {
+        return Err(
+            "This account is already linked to a primary asset. Edit its links there.".into(),
+        );
+    }
+    let mut unique = std::collections::HashSet::new();
+    for id in linked_asset_ids {
+        if !unique.insert(id) {
+            return Err("An asset can only be selected once".into());
+        }
+        if !options
+            .linked_assets
+            .iter()
+            .chain(&options.available_assets)
+            .any(|item| &item.id == id)
+        {
+            return Err(
+                "A selected asset is unavailable or already linked. Reload and try again.".into(),
+            );
+        }
+    }
+    tx.execute(
+        "UPDATE settings SET value = '' WHERE key GLOB 'asset_parent:*' AND value = ?1",
+        [asset_id],
+    )
+    .map_err(|e| e.to_string())?;
+    for id in linked_asset_ids {
+        tx.execute(
+            "INSERT OR REPLACE INTO settings(key, value) VALUES (?1, ?2)",
+            rusqlite::params![format!("asset_parent:{id}"), asset_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_linked_assets(
+    state: State<'_, AppState>,
+    asset_id: String,
+    linked_asset_ids: Vec<String>,
+) -> Result<(), String> {
+    with_db_rw(&state, |db| {
+        set_linked_assets_in_db(db, &asset_id, &linked_asset_ids)
+    })
+}
+
+fn query_account_values(
+    db: &Connection,
+    account_id: &str,
+    include_linked: bool,
+) -> Result<Vec<AccountValue>, String> {
+    let ids = if include_linked {
+        asset_member_ids(db, account_id)?
+    } else {
+        vec![account_id.to_string()]
+    };
+    let combined = ids.len() > 1;
+    let mut events = std::collections::BTreeMap::<String, Vec<(String, AccountValue)>>::new();
+    for id in &ids {
+        let mut stmt = db.prepare("SELECT id, account_id, balance, recorded_date FROM account_values WHERE account_id = ?1 ORDER BY recorded_date, id")
+            .map_err(|e| e.to_string())?;
+        let values = stmt
+            .query_map([id], |row| {
+                Ok(AccountValue {
+                    id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    balance: row.get(2)?,
+                    recorded_date: row.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        // A missing member is unknown, not a zero balance.
+        if combined && values.is_empty() {
+            return Ok(vec![]);
+        }
+        for value in values {
+            events
+                .entry(value.recorded_date.clone())
+                .or_default()
+                .push((id.clone(), value));
+        }
+    }
+    let mut balances = std::collections::BTreeMap::new();
+    let mut result = Vec::new();
+    for (date, values) in events {
+        let mut row_id = 0;
+        for (id, value) in values {
+            row_id = value.id;
+            balances.insert(id, value.balance);
+        }
+        // Before a provider's first observation it contributes zero; afterwards
+        // carry its latest recorded value, including an explicit closing zero.
+        let balance: f64 = balances.values().sum();
+        if !balance.is_finite() {
+            return Err("Account history contains a non-finite balance".into());
+        }
+        result.push(AccountValue {
+            id: row_id,
+            account_id: account_id.into(),
+            balance,
+            recorded_date: date,
+        });
+    }
+    Ok(result)
+}
+
+fn query_display_summaries(
+    db: &Connection,
+    ignored_only: bool,
+) -> Result<Vec<AccountSummary>, String> {
+    let mut summaries = query_accounts_summary(db, ignored_only)?;
+    for item in &mut summaries {
+        let ids = asset_member_ids(db, &item.account.id)?;
+        if ids.len() < 2 {
+            continue;
+        }
+        let values = query_account_values(db, &item.account.id, true)?;
+        item.combined = Some(CombinedAssetSummary {
+            account_count: ids.len(),
+            latest_balance: values.last().map(|v| v.balance),
+            previous_balance: previous_stored_balance(&values),
+            latest_date: values.last().map(|v| v.recorded_date.clone()),
+            max_balance: values.iter().map(|v| v.balance).reduce(f64::max),
+        });
+    }
+    Ok(summaries)
 }
 
 // Each liability has one assignment. Empty values are unlink tombstones so a
@@ -1513,6 +1765,61 @@ fn query_asset_financing(
     }))
 }
 
+fn query_combined_financing(
+    db: &Connection,
+    account_id: &str,
+    balance: Option<f64>,
+) -> Result<Option<AssetFinancing>, String> {
+    let ids = asset_member_ids(db, account_id)?;
+    if ids.len() < 2 {
+        return Ok(None);
+    }
+    let expected_count = liability_asset_links(db)?
+        .values()
+        .filter(|owner| ids.contains(owner))
+        .count();
+    let mut linked_liabilities = Vec::new();
+    for id in ids {
+        let own_balance = query_account_values(db, &id, false)?
+            .last()
+            .map(|v| v.balance);
+        if let Some(financing) = query_asset_financing(db, &id, own_balance)? {
+            linked_liabilities.extend(financing.linked_liabilities);
+        }
+    }
+    if expected_count == 0 {
+        return Ok(None);
+    }
+    linked_liabilities.sort_by(|a, b| a.id.cmp(&b.id));
+    linked_liabilities.dedup_by(|a, b| a.id == b.id);
+    let total_debt = if linked_liabilities.len() != expected_count {
+        None
+    } else {
+        linked_liabilities.iter().try_fold(0.0_f64, |sum, item| {
+            item.balance.filter(|v| v.is_finite()).and_then(|v| {
+                let next = sum + (-v).max(0.0);
+                next.is_finite().then_some(next)
+            })
+        })
+    };
+    let equity_amount = balance
+        .zip(total_debt)
+        .map(|(value, debt)| value - debt)
+        .filter(|v| v.is_finite());
+    let equity_percent = balance
+        .filter(|v| *v > 0.0)
+        .zip(equity_amount)
+        .map(|(value, equity)| equity / value * 100.0)
+        .filter(|v| v.is_finite());
+    Ok(Some(AssetFinancing {
+        linked_liabilities,
+        available_liabilities: vec![],
+        total_debt,
+        equity_amount,
+        equity_percent,
+    }))
+}
+
 fn set_asset_liabilities_in_db(
     db: &Connection,
     asset_id: &str,
@@ -1577,132 +1884,128 @@ fn set_asset_liabilities(
 fn get_account_history(
     state: State<'_, AppState>,
     account_id: String,
+    include_linked: Option<bool>,
 ) -> Result<AccountHistory, String> {
     with_db_ro(&state, |db| {
-        // Get account info
-        let account = db
-            .query_row(
-                "SELECT id, name, type, institution, currency, is_manual, is_ignored,
+        query_account_history(db, &account_id, include_linked.unwrap_or(true))
+    })
+}
+
+fn query_account_history(
+    db: &Connection,
+    account_id: &str,
+    include_linked: bool,
+) -> Result<AccountHistory, String> {
+    // Get account info
+    let account = db
+        .query_row(
+            "SELECT id, name, type, institution, currency, is_manual, is_ignored,
                         interest_rate, repayment_amount, repayment_frequency,
                         repayment_frequency_unit, rate_expiry, initial_next_repayment_date
                  FROM accounts WHERE id = ?1",
-                rusqlite::params![account_id],
-                |row| {
-                    Ok(Account {
-                        id: row.get(0)?,
-                        name: row.get(1)?,
-                        account_type: row.get(2)?,
-                        institution: row.get(3)?,
-                        currency: row.get(4)?,
-                        is_manual: row.get::<_, i32>(5)? != 0,
-                        is_ignored: row.get::<_, i32>(6)? != 0,
-                        interest_rate: row.get(7)?,
-                        repayment_amount: row.get(8)?,
-                        repayment_frequency: row.get(9)?,
-                        repayment_frequency_unit: row.get(10)?,
-                        rate_expiry: row.get(11)?,
-                        initial_next_repayment_date: row.get(12)?,
-                    })
-                },
-            )
-            .map_err(|e| format!("Account not found: {}", e))?;
-
-        // Get values ordered by date
-        let mut stmt = db
-            .prepare(
-                "SELECT id, account_id, balance, recorded_date
-                 FROM account_values
-                 WHERE account_id = ?1
-                 ORDER BY recorded_date ASC, id ASC",
-            )
-            .map_err(|e| e.to_string())?;
-
-        let values: Vec<AccountValue> = stmt
-            .query_map(rusqlite::params![account_id], |row| {
-                Ok(AccountValue {
+            rusqlite::params![account_id],
+            |row| {
+                Ok(Account {
                     id: row.get(0)?,
-                    account_id: row.get(1)?,
-                    balance: row.get(2)?,
-                    recorded_date: row.get(3)?,
+                    name: row.get(1)?,
+                    account_type: row.get(2)?,
+                    institution: row.get(3)?,
+                    currency: row.get(4)?,
+                    is_manual: row.get::<_, i32>(5)? != 0,
+                    is_ignored: row.get::<_, i32>(6)? != 0,
+                    interest_rate: row.get(7)?,
+                    repayment_amount: row.get(8)?,
+                    repayment_frequency: row.get(9)?,
+                    repayment_frequency_unit: row.get(10)?,
+                    rate_expiry: row.get(11)?,
+                    initial_next_repayment_date: row.get(12)?,
                 })
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
+            },
+        )
+        .map_err(|e| format!("Account not found: {}", e))?;
 
-        let current_balance = values.last().map(|v| v.balance);
-        let previous_balance = previous_stored_balance(&values);
-        let min_balance = values
-            .iter()
-            .map(|v| v.balance)
-            .fold(f64::INFINITY, f64::min);
-        let max_balance = values
-            .iter()
-            .map(|v| v.balance)
-            .fold(f64::NEG_INFINITY, f64::max);
+    let values = query_account_values(db, account_id, include_linked)?;
+    let own_balance = query_account_values(db, account_id, false)?
+        .last()
+        .map(|v| v.balance);
+    let current_balance = values.last().map(|v| v.balance);
+    let previous_balance = previous_stored_balance(&values);
+    let min_balance = values
+        .iter()
+        .map(|v| v.balance)
+        .fold(f64::INFINITY, f64::min);
+    let max_balance = values
+        .iter()
+        .map(|v| v.balance)
+        .fold(f64::NEG_INFINITY, f64::max);
 
-        // Date the min/max value last occurred. `values` is ordered ASC by
-        // date, so iterating and keeping the last match gives the most recent
-        // date on which that extreme balance was recorded (ties included).
-        let min_balance_date = if min_balance.is_finite() {
-            values
-                .iter()
-                .rev()
-                .find(|v| v.balance == min_balance)
-                .map(|v| v.recorded_date.clone())
+    // Date the min/max value last occurred. `values` is ordered ASC by
+    // date, so iterating and keeping the last match gives the most recent
+    // date on which that extreme balance was recorded (ties included).
+    let min_balance_date = if min_balance.is_finite() {
+        values
+            .iter()
+            .rev()
+            .find(|v| v.balance == min_balance)
+            .map(|v| v.recorded_date.clone())
+    } else {
+        None
+    };
+    let max_balance_date = if max_balance.is_finite() {
+        values
+            .iter()
+            .rev()
+            .find(|v| v.balance == max_balance)
+            .map(|v| v.recorded_date.clone())
+    } else {
+        None
+    };
+
+    let (next_repayment_date, estimated_repayment_date, repayment_estimate_status) =
+        if account.id == "__liabilities_total__" {
+            calculate_liabilities_total_repayment_dates(db, Local::now().date_naive())
+                .map_err(|e| e.to_string())?
+        } else {
+            calculate_repayment_dates(&account, own_balance, Local::now().date_naive())
+        };
+
+    let is_retired = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM settings WHERE key = ?1 AND value = 'true')",
+            [format!("retired_account:{}", account.id)],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+
+    let asset_financing = query_asset_financing(db, &account.id, own_balance)?;
+    Ok(AccountHistory {
+        combined_financing: if include_linked {
+            query_combined_financing(db, account_id, current_balance)?
         } else {
             None
-        };
-        let max_balance_date = if max_balance.is_finite() {
-            values
-                .iter()
-                .rev()
-                .find(|v| v.balance == max_balance)
-                .map(|v| v.recorded_date.clone())
+        },
+        asset_links: query_asset_links(db, account_id)?,
+        asset_financing,
+        is_retired,
+        account,
+        values,
+        current_balance,
+        previous_balance,
+        min_balance: if min_balance.is_finite() {
+            Some(min_balance)
         } else {
             None
-        };
-
-        let (next_repayment_date, estimated_repayment_date, repayment_estimate_status) =
-            if account.id == "__liabilities_total__" {
-                calculate_liabilities_total_repayment_dates(db, Local::now().date_naive())
-                    .map_err(|e| e.to_string())?
-            } else {
-                calculate_repayment_dates(&account, current_balance, Local::now().date_naive())
-            };
-
-        let is_retired = db
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM settings WHERE key = ?1 AND value = 'true')",
-                [format!("retired_account:{}", account.id)],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-
-        let asset_financing = query_asset_financing(db, &account.id, current_balance)?;
-        Ok(AccountHistory {
-            asset_financing,
-            is_retired,
-            account,
-            values,
-            current_balance,
-            previous_balance,
-            min_balance: if min_balance.is_finite() {
-                Some(min_balance)
-            } else {
-                None
-            },
-            min_balance_date,
-            max_balance: if max_balance.is_finite() {
-                Some(max_balance)
-            } else {
-                None
-            },
-            max_balance_date,
-            next_repayment_date,
-            estimated_repayment_date,
-            repayment_estimate_status,
-        })
+        },
+        min_balance_date,
+        max_balance: if max_balance.is_finite() {
+            Some(max_balance)
+        } else {
+            None
+        },
+        max_balance_date,
+        next_repayment_date,
+        estimated_repayment_date,
+        repayment_estimate_status,
     })
 }
 
@@ -2011,130 +2314,52 @@ fn delete_last_manual_value(
     })
 }
 
+fn changes_from_values(values: &[AccountValue], today: NaiveDate) -> Vec<AccountChange> {
+    let current = values.last().map(|v| v.balance);
+    [
+        ("30d", Some(30)),
+        ("90d", Some(90)),
+        ("180d", Some(180)),
+        ("270d", Some(270)),
+        ("360d", Some(360)),
+        ("all", None),
+    ]
+    .into_iter()
+    .map(|(period, days)| {
+        let previous = match days {
+            None => values.first(),
+            Some(days) => today
+                .checked_sub_signed(Duration::days(days))
+                .and_then(|date| {
+                    let cutoff = date.format("%Y-%m-%d").to_string();
+                    values.iter().rev().find(|v| v.recorded_date <= cutoff)
+                }),
+        };
+        let amount = current.zip(previous).map(|(cur, prev)| cur - prev.balance);
+        AccountChange {
+            period: period.into(),
+            previous_balance: previous.map(|v| v.balance),
+            previous_date: previous.map(|v| v.recorded_date.clone()),
+            change_amount: amount,
+            change_percent: amount.zip(previous).and_then(|(amount, prev)| {
+                (prev.balance != 0.0).then(|| amount / prev.balance.abs() * 100.0)
+            }),
+        }
+    })
+    .collect()
+}
+
 #[tauri::command]
 fn get_account_changes(
     state: State<'_, AppState>,
     account_id: String,
+    include_linked: Option<bool>,
 ) -> Result<Vec<AccountChange>, String> {
     with_db_ro(&state, |db| {
-        // Get the latest value for this account
-        let current_balance: Option<f64> = db
-            .query_row(
-                "SELECT balance
-                 FROM account_values
-                 WHERE account_id = ?1
-                 ORDER BY recorded_date DESC, id DESC
-                 LIMIT 1",
-                rusqlite::params![account_id],
-                |row| row.get(0),
-            )
-            .ok();
-
-        // Find the earliest measurement for this account. The date gates the
-        // fixed lookbacks, while the balance is the baseline for "all time".
-        let earliest_measurement: Option<(f64, String)> = db
-            .query_row(
-                "SELECT balance, recorded_date
-                 FROM account_values
-                 WHERE account_id = ?1
-                 ORDER BY recorded_date ASC, id ASC
-                 LIMIT 1",
-                rusqlite::params![account_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .ok();
-
-        let today = Local::now().format("%Y-%m-%d").to_string();
-
-        let periods: Vec<(&str, i64)> = vec![
-            ("30d", 30),
-            ("90d", 90),
-            ("180d", 180),
-            ("270d", 270),
-            ("360d", 360),
-        ];
-
-        let mut results = Vec::new();
-
-        for (label, days) in periods {
-            let lookback_date = chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d")
-                .ok()
-                .and_then(|d| d.checked_sub_signed(chrono::Duration::days(days)))
-                .map(|d| d.format("%Y-%m-%d").to_string());
-
-            let (prev_balance, prev_date): (Option<f64>, Option<String>) =
-                if let Some(ref lb) = lookback_date {
-                    // Check if the earliest measurement is after the lookback date
-                    let before_measurements = earliest_measurement
-                        .as_ref()
-                        .map(|(_, date)| date.as_str() > lb.as_str())
-                        .unwrap_or(true);
-
-                    if before_measurements {
-                        (None, None)
-                    } else {
-                        // Get the value closest to (≤) the lookback date
-                        db.query_row(
-                            "SELECT balance, recorded_date
-                             FROM account_values
-                             WHERE account_id = ?1 AND recorded_date <= ?2
-                             ORDER BY recorded_date DESC, id DESC
-                             LIMIT 1",
-                            rusqlite::params![account_id, lb],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
-                        )
-                        .unwrap_or((None, None))
-                    }
-                } else {
-                    (None, None)
-                };
-
-            let change = match (current_balance, prev_balance) {
-                (Some(cur), Some(prev)) if prev != 0.0 => {
-                    let amount = cur - prev;
-                    // Use the magnitude of the previous balance as the base so
-                    // that liabilities (stored as negative balances) show a
-                    // percentage whose sign matches the dollar change: paying
-                    // down a debt is an improvement (positive change), not a
-                    // negative one. For assets (prev > 0) `prev.abs()` is a
-                    // no-op, so their displayed percentage is unchanged.
-                    let percent = (amount / prev.abs()) * 100.0;
-                    (Some(amount), Some(percent))
-                }
-                (Some(cur), Some(prev)) => (Some(cur - prev), None),
-                _ => (None, None),
-            };
-
-            results.push(AccountChange {
-                period: label.to_string(),
-                previous_balance: prev_balance,
-                previous_date: prev_date,
-                change_amount: change.0,
-                change_percent: change.1,
-            });
-        }
-
-        let (all_time_balance, all_time_date) = earliest_measurement
-            .map(|(balance, date)| (Some(balance), Some(date)))
-            .unwrap_or((None, None));
-        let all_time_change = match (current_balance, all_time_balance) {
-            (Some(cur), Some(prev)) if prev != 0.0 => {
-                let amount = cur - prev;
-                (Some(amount), Some((amount / prev.abs()) * 100.0))
-            }
-            (Some(cur), Some(prev)) => (Some(cur - prev), None),
-            _ => (None, None),
-        };
-
-        results.push(AccountChange {
-            period: "all".to_string(),
-            previous_balance: all_time_balance,
-            previous_date: all_time_date,
-            change_amount: all_time_change.0,
-            change_percent: all_time_change.1,
-        });
-
-        Ok(results)
+        Ok(changes_from_values(
+            &query_account_values(db, &account_id, include_linked.unwrap_or(true))?,
+            Local::now().date_naive(),
+        ))
     })
 }
 
@@ -2927,6 +3152,202 @@ mod tests {
             rate_expiry: Some("2026-12-31".into()),
             initial_next_repayment_date: next_date.map(str::to_string),
         }
+    }
+
+    fn provider_assets_db() -> Connection {
+        let db = test_db();
+        db.execute_batch("INSERT INTO accounts(id,name,currency) VALUES
+            ('new','New provider','NZD'),('old','Old provider','NZD'),('third','Third provider','NZD'),
+            ('loan','Loan','NZD'),('foreign','Foreign','USD');
+            INSERT INTO account_values(account_id,balance,recorded_date) VALUES
+            ('old',100,'2026-01-01'),('old',110,'2026-02-01'),('new',0,'2026-02-01'),
+            ('old',0,'2026-03-01'),('new',114,'2026-03-01'),('new',115,'2026-03-01'),
+            ('new',120,'2026-04-01'),('third',50,'2026-01-01'),('loan',-10,'2026-01-01'),('foreign',10,'2026-01-01');
+            INSERT INTO settings(key,value) VALUES('retired_account:old','true');").unwrap();
+        db
+    }
+
+    #[test]
+    fn linked_assets_continue_provider_history_and_leave_totals_untouched() {
+        let db = provider_assets_db();
+        recompute_total(&db, "2026-04-01").unwrap();
+        let raw_before = serde_json::to_value(query_accounts_summary(&db, false).unwrap()).unwrap();
+        let total_before = query_account_values(&db, "__total__", false).unwrap();
+        set_linked_assets_in_db(&db, "new", &["old".into()]).unwrap();
+        let history = query_account_history(&db, "new", true).unwrap();
+        assert_eq!(
+            history.values.iter().map(|v| v.balance).collect::<Vec<_>>(),
+            vec![100.0, 110.0, 115.0, 120.0]
+        );
+        assert_eq!(history.current_balance, Some(120.0));
+        assert_eq!(history.previous_balance, Some(115.0));
+        assert_eq!(history.min_balance, Some(100.0));
+        assert_eq!(history.min_balance_date.as_deref(), Some("2026-01-01"));
+        assert_eq!(history.max_balance, Some(120.0));
+        assert!(history.asset_links.unwrap().linked_assets[0].is_retired);
+        let individual = query_account_history(&db, "new", false).unwrap();
+        assert_eq!(individual.values.len(), 3);
+        assert_eq!(individual.min_balance, Some(0.0));
+        let changes = changes_from_values(
+            &history.values,
+            NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+        );
+        assert_eq!(changes[0].previous_balance, Some(115.0));
+        assert_eq!(changes[0].change_amount, Some(5.0));
+        assert_eq!(changes[1].change_amount, Some(20.0));
+        assert_eq!(changes[2].change_amount, None);
+        assert_eq!(changes.last().unwrap().change_percent, Some(20.0));
+        let summaries = query_display_summaries(&db, false).unwrap();
+        let new = summaries.iter().find(|a| a.account.id == "new").unwrap();
+        assert_eq!(
+            new.combined.as_ref().unwrap().latest_balance,
+            history.current_balance
+        );
+        assert_eq!(new.combined.as_ref().unwrap().account_count, 2);
+        assert_eq!(
+            serde_json::to_value(query_accounts_summary(&db, false).unwrap()).unwrap(),
+            raw_before
+        );
+        assert_eq!(
+            serde_json::to_value(query_account_values(&db, "__total__", true).unwrap()).unwrap(),
+            serde_json::to_value(total_before).unwrap()
+        );
+    }
+
+    #[test]
+    fn linked_assets_carry_forward_only_observed_values_and_preserve_unknowns() {
+        let db = provider_assets_db();
+        set_linked_assets_in_db(&db, "new", &["old".into(), "third".into()]).unwrap();
+        db.execute("UPDATE accounts SET is_ignored=1 WHERE id='old'", [])
+            .unwrap();
+        let history = query_account_history(&db, "new", true).unwrap();
+        assert_eq!(history.current_balance, Some(170.0));
+        assert_eq!(history.values[1].balance, 160.0); // third carries forward
+        assert!(history
+            .asset_links
+            .unwrap()
+            .linked_assets
+            .iter()
+            .any(|a| a.id == "old" && a.is_ignored));
+        db.execute("DELETE FROM account_values WHERE account_id='third'", [])
+            .unwrap();
+        let missing = query_account_history(&db, "new", true).unwrap();
+        assert_eq!(missing.current_balance, None);
+        assert!(missing.values.is_empty());
+        assert_eq!(
+            query_account_history(&db, "new", false)
+                .unwrap()
+                .current_balance,
+            Some(120.0)
+        );
+        // Existing links can be removed even after a valuation disappears.
+        set_linked_assets_in_db(&db, "new", &["old".into()]).unwrap();
+        assert_eq!(
+            query_account_history(&db, "new", true)
+                .unwrap()
+                .current_balance,
+            Some(120.0)
+        );
+    }
+
+    #[test]
+    fn linked_asset_validation_is_atomic_and_rejects_cycles_and_shared_members() {
+        let db = provider_assets_db();
+        set_linked_assets_in_db(&db, "new", &["old".into()]).unwrap();
+        for invalid in [
+            vec!["new"],
+            vec!["loan"],
+            vec!["foreign"],
+            vec!["__total__"],
+            vec!["missing"],
+            vec!["old", "old"],
+            vec!["third", "loan"],
+        ] {
+            let ids = invalid.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(set_linked_assets_in_db(&db, "new", &ids).is_err());
+            assert_eq!(
+                asset_parent_links(&db)
+                    .unwrap()
+                    .get("old")
+                    .map(String::as_str),
+                Some("new")
+            );
+            assert!(!asset_parent_links(&db).unwrap().contains_key("third"));
+        }
+        assert!(set_linked_assets_in_db(&db, "old", &["new".into()]).is_err());
+        assert!(set_linked_assets_in_db(&db, "third", &["new".into()]).is_err());
+        assert!(set_linked_assets_in_db(&db, "third", &["old".into()]).is_err());
+        assert!(set_linked_assets_in_db(&db, "__total__", &[]).is_err());
+        set_linked_assets_in_db(&db, "new", &[]).unwrap();
+        assert_eq!(
+            snapshot_setting(&db, "asset_parent:old").as_deref(),
+            Some("")
+        );
+        set_linked_assets_in_db(&db, "third", &["old".into()]).unwrap();
+        assert_eq!(
+            query_account_history(&db, "old", true)
+                .unwrap()
+                .asset_links
+                .unwrap()
+                .primary_asset
+                .unwrap()
+                .id,
+            "third"
+        );
+    }
+
+    #[test]
+    fn combined_equity_includes_each_members_debts_but_edits_remain_individual() {
+        let db = provider_assets_db();
+        db.execute_batch("INSERT INTO accounts(id,name,currency) VALUES('loan2','Other loan','NZD');
+            INSERT INTO account_values(account_id,balance,recorded_date) VALUES('loan2',-20,'2026-04-01');").unwrap();
+        set_asset_liabilities_in_db(&db, "new", &["loan".into()]).unwrap();
+        set_asset_liabilities_in_db(&db, "old", &["loan2".into()]).unwrap();
+        set_linked_assets_in_db(&db, "new", &["old".into()]).unwrap();
+        let history = query_account_history(&db, "new", true).unwrap();
+        let combined = history.combined_financing.unwrap();
+        assert_eq!(combined.linked_liabilities.len(), 2);
+        assert_eq!(combined.total_debt, Some(30.0));
+        assert_eq!(combined.equity_amount, Some(90.0));
+        assert_eq!(combined.equity_percent, Some(75.0));
+        assert_eq!(history.asset_financing.unwrap().linked_liabilities.len(), 1);
+        let individual = query_account_history(&db, "new", false).unwrap();
+        assert!(individual.combined_financing.is_none());
+        assert_eq!(
+            individual.asset_financing.unwrap().equity_amount,
+            Some(110.0)
+        );
+        db.execute("DELETE FROM account_values WHERE account_id='loan2'", [])
+            .unwrap();
+        assert_eq!(
+            query_account_history(&db, "new", true)
+                .unwrap()
+                .combined_financing
+                .unwrap()
+                .equity_amount,
+            None
+        );
+    }
+
+    #[test]
+    fn asset_linked_history_keeps_zero_baselines_and_negative_changes_honest() {
+        let db = provider_assets_db();
+        set_linked_assets_in_db(&db, "new", &["old".into()]).unwrap();
+        upsert_daily_account_value(&db, "old", 0.0, "2026-01-01").unwrap();
+        let zero = changes_from_values(
+            &query_account_values(&db, "new", true).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+        );
+        assert_eq!(zero.last().unwrap().change_percent, None);
+        assert_eq!(zero.last().unwrap().change_amount, Some(120.0));
+        upsert_daily_account_value(&db, "new", -5.0, "2026-04-01").unwrap();
+        assert_eq!(
+            query_account_history(&db, "new", true)
+                .unwrap()
+                .current_balance,
+            Some(-5.0)
+        );
+        set_linked_assets_in_db(&db, "new", &[]).unwrap();
     }
 
     fn equity_db() -> Connection {
@@ -3748,7 +4169,7 @@ fn create_mobile_snapshot(
             INSERT INTO main.account_values SELECT id,account_id,balance,recorded_date FROM origin.account_values;
             INSERT INTO main.fetch_log SELECT id,fetched_at FROM origin.fetch_log;
             INSERT INTO main.settings SELECT key,value FROM origin.settings
-                WHERE key = 'last_fetch_at' OR key GLOB 'retired_account:*' OR key GLOB 'liability_asset:*';")
+                WHERE key = 'last_fetch_at' OR key GLOB 'retired_account:*' OR key GLOB 'liability_asset:*' OR key GLOB 'asset_parent:*';")
             .map_err(|e| e.to_string())?;
         source_db
             .execute(
@@ -4059,6 +4480,7 @@ pub fn run() {
             get_accounts_summary,
             set_account_retired,
             set_asset_liabilities,
+            set_linked_assets,
             get_other_accounts_summary,
             get_account_history,
             get_account_changes,
@@ -4175,6 +4597,32 @@ mod mobile_sync_tests {
             Some("")
         );
         assert!(set_asset_liabilities_in_db(&db, "savings", &[]).is_err());
+    }
+
+    #[test]
+    fn mobile_snapshot_preserves_provider_links_and_combined_history() {
+        let dir = TestDirectory::new();
+        let src = dir.path("source.db");
+        let snapshot = dir.path("snapshot.db");
+        source(&src);
+        let db = Connection::open(&src).unwrap();
+        db.execute_batch("INSERT INTO accounts(id,name,currency) VALUES ('old','Old provider','NZD');
+            INSERT INTO account_values(account_id,balance,recorded_date) VALUES ('old',100,'2026-08-01'),('old',0,'2026-09-25');
+            INSERT INTO settings VALUES ('asset_parent:old','savings'),('asset_parent:removed','');").unwrap();
+        drop(db);
+        create_mobile_snapshot(&src, &snapshot).unwrap();
+        let db = open_db_ro(&snapshot).unwrap();
+        let history = query_account_history(&db, "savings", true).unwrap();
+        assert_eq!(
+            history.values.iter().map(|v| v.balance).collect::<Vec<_>>(),
+            vec![100.0, 150.0]
+        );
+        assert_eq!(history.asset_links.unwrap().linked_assets[0].id, "old");
+        assert_eq!(
+            snapshot_setting(&db, "asset_parent:removed").as_deref(),
+            Some("")
+        );
+        assert!(set_linked_assets_in_db(&db, "savings", &[]).is_err());
     }
 
     #[test]

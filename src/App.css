@@ -1159,3 +1159,8 @@ body {
   .btn { min-height: 44px; }
   .app { padding-bottom: max(24px, env(safe-area-inset-bottom)); }
 }
+
+/* Asset groups keep their view toggle outside the account navigation button. */
+.linked-assets, .asset-view-controls { margin: 1rem 0; }
+.asset-card-toggle { margin-top: 0.5rem; width: 100%; }
+.asset-view-controls .repayment-details-header { flex-wrap: wrap; gap: 0.75rem; }

@@ -20,6 +20,7 @@ import {
 } from "../chartAxis";
 import BalanceDirection from "../components/BalanceDirection";
 import RetirementToggle from "../components/RetirementToggle";
+import LinkedAssets from "../components/LinkedAssets";
 import AssetLiabilities from "../components/AssetLiabilities";
 
 type ChartRange = "1m" | "6m" | "1y" | "all";
@@ -84,6 +85,8 @@ function AccountDetailScreen({ id }: { id: string | undefined }) {
   const [deleting, setDeleting] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
 
+  const [showIndividual, setShowIndividual] = useState(false);
+  const [editingAssets, setEditingAssets] = useState(false);
   const [editingLinks, setEditingLinks] = useState(false);
   const readHistory = useCallback(async () => {
     if (!id) throw new Error("Account not found");
@@ -92,14 +95,20 @@ function AccountDetailScreen({ id }: { id: string | undefined }) {
       invoke<AccountHistory>("get_account_history", { accountId: decodedId }),
       invoke<AccountChange[]>("get_account_changes", { accountId: decodedId }),
     ]);
-    return { history, changes };
+    if (!history.asset_links?.linked_assets.length) return { history, changes, individualHistory: history, individualChanges: changes };
+    const [individualHistory, individualChanges] = await Promise.all([
+      invoke<AccountHistory>("get_account_history", { accountId: decodedId, includeLinked: false }),
+      invoke<AccountChange[]>("get_account_changes", { accountId: decodedId, includeLinked: false }),
+    ]);
+    return { history, changes, individualHistory, individualChanges };
   }, [id]);
   const { data: snapshot, loading, error, refresh: loadHistory } = useLiveData(
     readHistory,
-    editingRepayment || savingRepayment || editingLinks || addValue !== "" || adding || deleting || confirmingDelete,
+    editingRepayment || savingRepayment || editingLinks || editingAssets || addValue !== "" || adding || deleting || confirmingDelete,
   );
-  const data = snapshot?.history ?? null;
-  const changes = snapshot?.changes ?? [];
+  const data = (showIndividual ? snapshot?.individualHistory : snapshot?.history) ?? null;
+  const ownData = snapshot?.individualHistory ?? null;
+  const changes = (showIndividual ? snapshot?.individualChanges : snapshot?.changes) ?? [];
 
   const resetRepaymentDraft = useCallback(() => {
     if (!data) return;
@@ -314,9 +323,22 @@ function AccountDetailScreen({ id }: { id: string | undefined }) {
 
       {!readOnly && !data.account.id.startsWith("__") && !data.account.is_ignored && (
         <div className="retirement-details">
-          <RetirementToggle item={data} onChanged={loadHistory} />
+          <RetirementToggle item={ownData ?? data} onChanged={loadHistory} />
           <p>Retired accounts appear on the Retired Accounts page. Their balances and history still count toward virtual-account progress.</p>
         </div>
+      )}
+
+      {!!data.asset_links?.linked_assets.length && (
+        <section className="card asset-view-controls" aria-label="Asset view">
+          <div className="repayment-details-header">
+            <strong>{showIndividual ? "This asset only" : `Combined · ${data.asset_links.linked_assets.length + 1} accounts`}</strong>
+            <button className="btn btn-secondary" aria-pressed={showIndividual} onClick={() => {
+              setShowIndividual(value => !value); setHoveredChartIndex(null);
+            }}>{showIndividual ? "Show combined assets" : "Show this asset only"}</button>
+          </div>
+          <p className="calculation-note">{showIndividual ? "Showing only this account’s balances and changes. The links are unchanged." : "The chart, current value, highs, lows and changes include linked assets. Balances carry forward from each account’s first record; earlier dates contribute zero. A recorded closing zero is needed to stop an old balance carrying forward. Different provider update dates can cause temporary transfer spikes or dips. These are balance changes, not investment returns."}</p>
+          {!showIndividual && data.values.length === 0 && <p role="status">Combined figures are unavailable because an account has no recorded values.</p>}
+        </section>
       )}
 
       {data.values.length > 0 ? (
@@ -369,6 +391,7 @@ function AccountDetailScreen({ id }: { id: string | undefined }) {
                 tickMargin={8}
               />
               <Line
+                isAnimationActive={false}
                 type="monotone"
                 dataKey="balance"
                 stroke="var(--accent)"
@@ -442,11 +465,12 @@ function AccountDetailScreen({ id }: { id: string | undefined }) {
       </div>
 
       {/* Historical changes */}
-      {data.asset_financing && (
+      {(data.asset_financing || data.combined_financing) && (
         <AssetLiabilities
           key={data.account.id}
           assetId={data.account.id}
-          financing={data.asset_financing}
+          financing={data.asset_financing ?? { linked_liabilities: [], available_liabilities: [], total_debt: null, equity_amount: null, equity_percent: null }}
+          summary={data.combined_financing}
           readOnly={readOnly}
           onChanged={loadHistory}
           onEditingChange={setEditingLinks}
@@ -504,8 +528,8 @@ function AccountDetailScreen({ id }: { id: string | undefined }) {
         </div>
       )}
 
-      {data.current_balance != null &&
-        data.current_balance < 0 &&
+      {ownData?.current_balance != null &&
+        ownData.current_balance < 0 &&
         (data.account.id === "__liabilities_total__" ||
           !data.account.id.startsWith("__")) && (
           <div className="card liability-repayment-form">
@@ -699,11 +723,13 @@ function AccountDetailScreen({ id }: { id: string | undefined }) {
           </div>
         )}
 
+      {data.asset_links && <LinkedAssets assetId={data.account.id} links={data.asset_links} readOnly={readOnly} onChanged={loadHistory} onEditingChange={setEditingAssets} />}
+
       {/* Manual account: add value form */}
       {!readOnly && data.account.is_manual && (
         <div className="card add-value-form">
           <div className="form-group">
-            <label htmlFor="addValue">Add today's balance</label>
+            <label htmlFor="addValue">Add today's balance for this account</label>
             <input
               id="addValue"
               type="number"
@@ -721,7 +747,7 @@ function AccountDetailScreen({ id }: { id: string | undefined }) {
           >
             {adding ? "Saving..." : "Save"}
           </button>
-          {data.values.length > 0 && (
+          {(ownData?.values.length ?? 0) > 0 && (
             <button
               className="btn"
               onClick={handleDeleteLastValue}

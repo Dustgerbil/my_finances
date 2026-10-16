@@ -12,7 +12,7 @@ const origin = process.env.TEST_ORIGIN || 'http://127.0.0.1:1420';
   await page.route(`${origin}/`, async route => {
     const response = await route.fetch();
     const html = await response.text();
-    await route.fulfill({ response, body: html.replace('<script type="module" src="/src/main.tsx"></script>', `<script type="module">
+    await route.fulfill({ response, body: html.replace(/<script type="module" src="\/src\/main\.tsx[^"]*"><\/script>/, `<script type="module">
       import { mockIPC } from '/node_modules/@tauri-apps/api/mocks.js';
       import { emit } from '/node_modules/@tauri-apps/api/event.js';
       const account = (id) => ({ id, name: id === 'house' ? 'Test House' : 'Test Mortgage', type: 'PROPERTY', institution: 'Test', currency: 'NZD', is_manual: true, is_ignored: false, interest_rate: 5, repayment_amount: 1000, repayment_frequency: 1, repayment_frequency_unit: 'months', rate_expiry: null, initial_next_repayment_date: '2026-11-01' });

@@ -27,7 +27,22 @@ export interface DeletedValue {
   recorded_date: string;
 }
 
+export interface CombinedAssetSummary {
+  account_count: number;
+  latest_balance: number | null;
+  previous_balance: number | null;
+  latest_date: string | null;
+  max_balance: number | null;
+}
+
+export interface AssetLinks {
+  linked_assets: FinancingLiability[];
+  available_assets: FinancingLiability[];
+  primary_asset: FinancingLiability | null;
+}
+
 export interface AccountSummary {
+  combined: CombinedAssetSummary | null;
   is_retired: boolean;
   account: Account;
   latest_balance: number | null;
@@ -37,6 +52,8 @@ export interface AccountSummary {
 }
 
 export interface AccountHistory {
+  combined_financing: AssetFinancing | null;
+  asset_links: AssetLinks | null;
   asset_financing: AssetFinancing | null;
   is_retired: boolean;
   account: Account;
