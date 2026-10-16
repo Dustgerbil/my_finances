@@ -4,7 +4,7 @@ On the primary asset's detail page, use **Linked assets → Link assets**, selec
 previous provider accounts, and save. Retired and ignored accounts are eligible.
 The primary asset defaults to combined balances, history, minimum/maximum and
 period changes. **Show this asset only** switches those figures temporarily;
-**Show combined assets** switches back. Dashboard, Retired Accounts and Other
+**Show combined assets** switches back. The dashboard always shows combined figures. Retired Accounts and Other
 Accounts cards offer the same view control. Opening a page again resets its view.
 Linked provider accounts retain their own pages and link back to the primary.
 
