@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import type { AssetFinancing, FinancingLiability } from "../types";
@@ -14,16 +14,18 @@ function liabilityDetails(item: FinancingLiability) {
     .filter(Boolean).join(" · ");
 }
 
-export default function AssetLiabilities({ assetId, financing, readOnly, onChanged }: {
+export default function AssetLiabilities({ assetId, financing, readOnly, onChanged, onEditingChange }: {
   assetId: string;
   financing: AssetFinancing;
   readOnly: boolean;
   onChanged: () => Promise<void>;
+  onEditingChange: (editing: boolean) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [selected, setSelected] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  useEffect(() => { onEditingChange(editing || saving); }, [editing, saving, onEditingChange]);
   const linked = financing.linked_liabilities;
   const options = [...linked, ...financing.available_liabilities];
 

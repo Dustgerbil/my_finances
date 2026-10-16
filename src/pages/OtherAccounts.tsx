@@ -1,5 +1,5 @@
-import { listen } from "@tauri-apps/api/event";
-import { useCallback, useEffect, useState } from "react";
+import { useLiveData } from "../useLiveData";
+import { useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useNavigate } from "react-router";
 import { formatAccountType } from "../format";
@@ -22,31 +22,12 @@ function formatDate(value: string | null | undefined): string {
 
 export default function OtherAccounts() {
   const navigate = useNavigate();
-  const [accounts, setAccounts] = useState<AccountSummary[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const loadAccounts = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await invoke<AccountSummary[]>("get_other_accounts_summary");
-      setAccounts(data);
-    } catch (err) {
-      setError(`Failed to load other accounts: ${err}`);
-    } finally {
-      setLoading(false);
-    }
+  const readAccounts = useCallback(async () => {
+    const accounts = await invoke<AccountSummary[]>("get_other_accounts_summary");
+    return accounts;
   }, []);
-
-  useEffect(() => {
-    void loadAccounts();
-    let disposed = false;
-    let stop: (() => void) | undefined;
-    listen("db-changed", () => void loadAccounts()).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten; });
-    return () => { disposed = true; stop?.(); };
-  }, [loadAccounts]);
-
+  const { data, loading, error } = useLiveData(readAccounts);
+  const accounts = data ?? [];
   return (
     <div>
       <button className="btn btn-back" onClick={() => navigate("/")}>

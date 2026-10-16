@@ -2,7 +2,7 @@ import { useReadOnly } from "../sync";
 import { useState, useEffect, useCallback } from "react";
 import { useNavigate, useParams } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { useLiveData } from "../useLiveData";
 import {
   LineChart,
   Line,
@@ -46,13 +46,13 @@ function subtractMonths(dateString: string, months: number) {
 }
 
 export default function AccountDetail() {
-  const readOnly = useReadOnly();
   const { id } = useParams<{ id: string }>();
+  return <AccountDetailScreen key={id} id={id} />;
+}
+
+function AccountDetailScreen({ id }: { id: string | undefined }) {
+  const readOnly = useReadOnly();
   const navigate = useNavigate();
-  const [data, setData] = useState<AccountHistory | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [changes, setChanges] = useState<AccountChange[]>([]);
   const [chartRange, setChartRange] = useState<ChartRange>("1y");
   const [hoveredChartIndex, setHoveredChartIndex] = useState<number | null>(null);
 
@@ -84,27 +84,22 @@ export default function AccountDetail() {
   const [deleting, setDeleting] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
 
-  const loadHistory = useCallback(async () => {
-    if (!id) return;
-    setLoading(true);
-    try {
-      const decodedId = decodeURIComponent(id);
-      const [result, changeData] = await Promise.all([
-        invoke<AccountHistory>("get_account_history", { accountId: decodedId }),
-        invoke<AccountChange[]>("get_account_changes", { accountId: decodedId }),
-      ]);
-      setData(result);
-      setChanges(changeData);
-    } catch (err) {
-      setError(`Failed to load account: ${err}`);
-    } finally {
-      setLoading(false);
-    }
+  const [editingLinks, setEditingLinks] = useState(false);
+  const readHistory = useCallback(async () => {
+    if (!id) throw new Error("Account not found");
+    const decodedId = decodeURIComponent(id);
+    const [history, changes] = await Promise.all([
+      invoke<AccountHistory>("get_account_history", { accountId: decodedId }),
+      invoke<AccountChange[]>("get_account_changes", { accountId: decodedId }),
+    ]);
+    return { history, changes };
   }, [id]);
-
-  useEffect(() => {
-    loadHistory();
-  }, [loadHistory]);
+  const { data: snapshot, loading, error, refresh: loadHistory } = useLiveData(
+    readHistory,
+    editingRepayment || savingRepayment || editingLinks || addValue !== "" || adding || deleting || confirmingDelete,
+  );
+  const data = snapshot?.history ?? null;
+  const changes = snapshot?.changes ?? [];
 
   const resetRepaymentDraft = useCallback(() => {
     if (!data) return;
@@ -119,25 +114,8 @@ export default function AccountDetail() {
   }, [data]);
 
   useEffect(() => {
-    resetRepaymentDraft();
-  }, [resetRepaymentDraft]);
-
-  // Listen for remote DB changes (another machine wrote and iCloud synced it
-  // down). Debounce: coalesce a burst of filesystem events into one reload.
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let timer: number | undefined;
-    listen("db-changed", () => {
-      if (timer) clearTimeout(timer);
-      timer = window.setTimeout(() => {
-        loadHistory();
-      }, 500);
-    }).then((u) => (unlisten = u));
-    return () => {
-      unlisten?.();
-      if (timer) clearTimeout(timer);
-    };
-  }, [loadHistory]);
+    if (!editingRepayment) resetRepaymentDraft();
+  }, [resetRepaymentDraft, editingRepayment]);
 
   const handleAddValue = async () => {
     if (!id || !addValue) return;
@@ -276,7 +254,7 @@ export default function AccountDetail() {
     );
   }
 
-  if (error || !data) {
+  if (!data) {
     return (
       <div>
         <button className="btn btn-back" onClick={() => navigate("/")}>
@@ -331,6 +309,8 @@ export default function AccountDetail() {
           </p>
         </div>
       </div>
+
+      {error && <div className="status status-error" role="alert">Failed to refresh account: {error}</div>}
 
       {!readOnly && !data.account.id.startsWith("__") && !data.account.is_ignored && (
         <div className="retirement-details">
@@ -469,6 +449,7 @@ export default function AccountDetail() {
           financing={data.asset_financing}
           readOnly={readOnly}
           onChanged={loadHistory}
+          onEditingChange={setEditingLinks}
         />
       )}
 

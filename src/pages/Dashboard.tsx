@@ -2,7 +2,7 @@ import { useReadOnly } from "../sync";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { useLiveData } from "../useLiveData";
 import { Cell, Pie, PieChart } from "recharts";
 import type { AccountSummary, AccountChange } from "../types";
 import { formatAccountType } from "../format";
@@ -48,10 +48,7 @@ function buildAccountMix(items: AccountSummary[]): AccountMixSlice[] {
 export default function Dashboard() {
   const readOnly = useReadOnly();
   const navigate = useNavigate();
-  const [accounts, setAccounts] = useState<AccountSummary[]>([]);
-  const [loading, setLoading] = useState(false);
   const [fetching, setFetching] = useState(false);
-  const [changes, setChanges] = useState<Record<string, AccountChange[]>>({});
   const [status, setStatus] = useState<{
     type: "loading" | "success" | "error";
     message: string;
@@ -81,33 +78,19 @@ export default function Dashboard() {
     }
   }, []);
 
-  const loadAccounts = useCallback(async () => {
-    setLoading(true);
-    try {
-      const data = await invoke<AccountSummary[]>("get_accounts_summary");
-      setAccounts(data);
-      const changePromises = data.map(async (item) => {
-        try {
-          const ch = await invoke<AccountChange[]>("get_account_changes", {
-            accountId: item.account.id,
-          });
-          return { id: item.account.id, changes: ch };
-        } catch {
-          return { id: item.account.id, changes: [] };
-        }
-      });
-      const results = await Promise.all(changePromises);
-      const changeMap: Record<string, AccountChange[]> = {};
-      for (const r of results) {
-        changeMap[r.id] = r.changes;
-      }
-      setChanges(changeMap);
-    } catch (err) {
-      setStatus({ type: "error", message: `Failed to load: ${err}` });
-    } finally {
-      setLoading(false);
-    }
+  const readAccounts = useCallback(async () => {
+    const accounts = await invoke<AccountSummary[]>("get_accounts_summary");
+    const results = await Promise.all(accounts.map(async (item) => {
+      const changes = await invoke<AccountChange[]>("get_account_changes", {
+        accountId: item.account.id,
+      }).catch(() => []);
+      return [item.account.id, changes] as const;
+    }));
+    return { accounts, changes: Object.fromEntries(results) };
   }, []);
+  const { data, loading, error, refresh: loadAccounts } = useLiveData(readAccounts, fetching);
+  const accounts = data?.accounts ?? [];
+  const changes = data?.changes ?? {};
 
   // Auto-fetch on first load if enabled
   useEffect(() => {
@@ -141,28 +124,6 @@ export default function Dashboard() {
     init();
     checkCredentials();
   }, [checkCredentials, loadAccounts, readOnly]);
-
-  useEffect(() => {
-    loadAccounts();
-  }, [loadAccounts]);
-
-  // Listen for remote DB changes (another machine wrote and iCloud synced it
-  // down). Debounce: coalesce a burst of filesystem events from one sync into
-  // a single reload. Also fires on our own writes, which is harmless.
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let timer: number | undefined;
-    listen("db-changed", () => {
-      if (timer) clearTimeout(timer);
-      timer = window.setTimeout(() => {
-        loadAccounts();
-      }, 500);
-    }).then((u) => (unlisten = u));
-    return () => {
-      unlisten?.();
-      if (timer) clearTimeout(timer);
-    };
-  }, [loadAccounts]);
 
   const handleFetch = async () => {
     setFetching(true);
@@ -520,6 +481,8 @@ export default function Dashboard() {
           </button>
         </div>
       )}
+
+      {error && <div className="status status-error" role="alert">Failed to load accounts: {error}</div>}
 
       {loading ? (
         <div className="empty-state">

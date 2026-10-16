@@ -1,38 +1,19 @@
 import { useReadOnly } from "../sync";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback } from "react";
 import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { useLiveData } from "../useLiveData";
 import type { AccountSummary } from "../types";
 
 export default function RetiredAccounts() {
   const readOnly = useReadOnly();
   const navigate = useNavigate();
-  const [accounts, setAccounts] = useState<AccountSummary[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const loadAccounts = useCallback(async () => {
-    try {
-      const data = await invoke<AccountSummary[]>("get_accounts_summary");
-      setAccounts(data.filter((item) => item.is_retired));
-      setError(null);
-    } catch (err) {
-      setError(`Failed to load retired accounts: ${err}`);
-    } finally {
-      setLoading(false);
-    }
+  const readAccounts = useCallback(async () => {
+    const accounts = await invoke<AccountSummary[]>("get_accounts_summary");
+    return accounts.filter((item) => item.is_retired);
   }, []);
-  useEffect(() => {
-    void loadAccounts();
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-    let timer: number | undefined;
-    listen("db-changed", () => {
-      window.clearTimeout(timer);
-      timer = window.setTimeout(() => void loadAccounts(), 500);
-    }).then((stop) => { if (disposed) stop(); else unlisten = stop; });
-    return () => { disposed = true; unlisten?.(); window.clearTimeout(timer); };
-  }, [loadAccounts]);
+  const { data, loading, error } = useLiveData(readAccounts);
+  const accounts = data ?? [];
   return (
     <div>
       <button className="btn btn-back" onClick={() => navigate("/")}>← Back to Home</button>
