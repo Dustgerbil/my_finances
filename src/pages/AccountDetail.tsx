@@ -336,7 +336,7 @@ function AccountDetailScreen({ id }: { id: string | undefined }) {
               setShowIndividual(value => !value); setHoveredChartIndex(null);
             }}>{showIndividual ? "Show combined assets" : "Show this asset only"}</button>
           </div>
-          <p className="calculation-note">{showIndividual ? "Showing only this account’s balances and changes. The links are unchanged." : "The chart, current value, highs, lows and changes include linked assets. Balances carry forward from each account’s first record; earlier dates contribute zero. A recorded closing zero is needed to stop an old balance carrying forward. Different provider update dates can cause temporary transfer spikes or dips. These are balance changes, not investment returns."}</p>
+          {showIndividual && <p className="calculation-note">Showing only this account’s balances and changes. The links are unchanged.</p>}
           {!showIndividual && data.values.length === 0 && <p role="status">Combined figures are unavailable because an account has no recorded values.</p>}
         </section>
       )}

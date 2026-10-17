@@ -59,6 +59,7 @@ export default function LinkedAssets({ assetId, links, readOnly, onChanged, onEd
         <span className="liability-link-balance">{money(item.balance)}</span>
       </li>)}
     </ul>}
+    {(editing ? selected.length : linked.length) > 0 && <p className="calculation-note">The chart, current value, highs, lows and changes include linked assets. Balances carry forward from each account’s first record; earlier dates contribute zero. A recorded closing zero is needed to stop an old balance carrying forward. Different provider update dates can cause temporary transfer spikes or dips. These are balance changes, not investment returns.</p>}
     {error && <p className="status-msg error" role="alert">{error}</p>}
   </section>;
 }
